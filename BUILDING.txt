@@ -1,0 +1,124 @@
+Fatal Frame (USA, Xbox) -> native Windows: source package
+==========================================================
+
+Layout
+------
+  project/    the game project that builds fatalframe.exe
+    src/main.c          host entry: boot order, crash handler, overlay/USB init
+    src/ff_launcher.c   first-run: find/extract the player's ISO, verify the
+                        XBE, runtime defaults, log file
+    src/ff_gpu.c        points the GPU model at XDK 4721 D3D's fence semaphore
+    src/recomp/gen/     the lifted game code (generated -- see "Regenerating")
+  toolkit/    xboxrecomp 0.17.0 with the fixes below applied
+  regen.sh / regen.bat             generate src/recomp/gen from your ISO
+
+IMPORTANT: project/src/recomp/gen is the game's own code translated to C.
+It is NOT in this repository: it is made from your own disc image, on your
+machine, by regen.bat. Do not commit or redistribute it.
+
+Generating the C (required before the first build)
+--------------------------------------------------
+  py -3 -m pip install capstone
+  regen.bat "C:\path\to\Fatal Frame (USA).xiso.iso"
+Takes ~1-2 minutes. Output is deterministic.
+
+Building with Visual Studio 2022 (reference toolchain)
+------------------------------------------------------
+  cd project
+  cmake -S . -B build
+  cmake --build build --config Release --parallel
+  -> build\Release\fatalframe.exe
+
+Building with MinGW-w64 (what the shipped exe was built with)
+-------------------------------------------------------------
+  From Linux/WSL:
+    cmake -S project -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_TOOLCHAIN_FILE=../toolkit/cmake/mingw-w64-x86_64.cmake
+    ninja -C build-mingw
+  (~2 minutes on 2 cores; the generated code is split 250 functions/file so
+  no single file needs more than ~1 GB of compiler memory.)
+
+Running
+-------
+Put fatalframe.exe anywhere; on first run it finds an .iso beside it (or in
+the folder above) or asks for one, extracts it to game\, checks default.xbe
+(size 1773568, CRC32 8C4A65AB) and starts. Log: fatalframe.log beside the exe
+(set FF_LOG_CONSOLE=1 to log to the console instead).
+
+Pipeline facts for this title
+-----------------------------
+  XBE: FATAL FRAME, title 0x54430004, XDK 4721, entry 0x000DAB5D
+  11 sections; code in .text, D3D, D3DX, XGRPH, DSOUND, WMVDEC, XPP
+  4,602 functions lifted, 0 failures, ~729k lines of C
+  6 untranslated instructions (aaa/aas/cli/sti), all in unreached
+  WMVDEC/XPP data -- reported as RECOMP_UNIMPL at runtime if ever hit.
+
+Runtime switches the launcher turns on (override by setting them first)
+-----------------------------------------------------------------------
+  RECOMP_PB_EXEC=1            execute the NV2A pushbuffer (graphics)
+  RECOMP_PB_WALK=segment      segment scan (the DMA walk needs a software-
+                              method interrupt the runtime does not model)
+  RECOMP_VBLANK=paced         60 Hz vblank interrupts
+  RECOMP_FLIP_PACING=1        hold flips to vblank
+  RECOMP_FB_WINDOW=1          the game window
+  RECOMP_AC97_READY=1         emulated APU (audio)
+  RECOMP_USB=1                emulated USB host controllers + pad
+  RECOMP_KEYBOARD=1           keyboard as controller 1
+  RECOMP_TITLE_KEVENTS=1      XDK D3D builds its fence event inline
+  RECOMP_CONTIG_AVOID_IMAGE=1 keep contiguous memory off the XBE image
+  RECOMP_SAVE_DIR=<exe>\saves
+
+Toolkit fixes made for this port (already applied in toolkit/)
+---------------------------------------------------------------
+1. kernel_bridge.c, NtDuplicateObject: always DUPLICATE_SAME_ACCESS. The
+   Xbox call has no access argument; duplicates were created with no rights,
+   so every read through them failed (ERROR_ACCESS_DENIED). Fatal Frame's
+   sound engine reads its banks through duplicated handles and hung on
+   "Now Loading".
+2. kernel_file.c: FILE_NO_INTERMEDIATE_BUFFERING is no longer mapped to
+   FILE_FLAG_NO_BUFFERING (host sector-alignment rules guest buffers can't
+   meet), plus a bounce-buffer retry for reads the host kernel refuses.
+3. usb/ohci.c, bus_resolve: heap pages the driver named through
+   MmGetPhysicalAddress resolve to RAM (same rule as the APU). XDK 4721 XPP
+   reads pad reports into pool memory; they were written to the contiguous
+   window instead and the game never saw a button.
+4. kernel_bridge.c: extra diagnostics (handle tokens and access masks on
+   file opens/reads).
+
+Game-project glue (project/src)
+-------------------------------
+  - D3D device pointer at 0x000F9B80; GPU semaphore pointer at device+0x34
+    (XDK 4721; later XDKs use +0x30) handed to nv2a_pb_set_semaphore_target.
+  - nv2a_hook_init + PVIDEO trap in the VEH: the WMV cutscenes play through
+    the NV2A video overlay.
+  - xbox_OhciInit: USB controllers (the template omitted it).
+
+Later fixes also applied in toolkit/ (highlights)
+-------------------------------------------------
+  5. nv2a_d3d11.c revived: hardware Direct3D 11 back end for the pushbuffer
+     executor -- full speed, internal-resolution scaling (1x-4x), widescreen
+     (Hor+ via a per-draw clip-space factor), swap-chain presentation into
+     the game window, and the F6 settings overlay (fb_present.c).
+  6. Fixed-address memory reservations (RECOMP_VM_FIXED): the game reserves
+     0x153A000 bytes at VA 0x01000000 and uses that address regardless;
+     without the fixed grant, XAPI/USB/DSound pool landed there and the
+     scene-change cutscenes crashed.
+  7. Pushbuffer wrap seam: the ring walk used to stop at the highest PUT
+     ever seen, but D3D's wrap jump lies past every PUT -- the commands
+     between were silently lost, eating random state writes (one-frame
+     white UI boxes, texture/transform glitches). The walk now runs to the
+     jump, and a method split across two kicks is continued instead of
+     having its tail misread as headers.
+  8. Guest scheduler made hardware-faithful: a waiter takes the one guest
+     CPU only when the holder truly blocks (probe-first waits announce it)
+     or a soft window has stood 2 ms, never inside a micro kernel call;
+     ISRs delivered on host threads borrow a worker stack and TIB (the APU
+     pattern) instead of running on a zeroed register file.
+
+Known limitations / next steps
+------------------------------
+  - FFP-path overlays (film grain, some HUD pieces) stretch in widescreen;
+    3D and vertex-shader UI are correct.
+  - RECOMP_PB_WALK=dma needs the NV2A software-method interrupt (PGRAPH
+    INTR 0x100000 -> D3D's DPC at 0x000F0490) to be raised; segment walk
+    is the supported mode.

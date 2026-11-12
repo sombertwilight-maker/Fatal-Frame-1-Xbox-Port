@@ -1,0 +1,24 @@
+# The game's own code and data never go in this repo.
+# regen.bat / regen.sh rebuild src/recomp/gen from YOUR disc image.
+project/src/recomp/gen/*
+!project/src/recomp/gen/.gitkeep
+work/
+game/
+saves/
+*.iso
+*.xiso
+*.xbe
+
+# build output
+build*/
+*.exe
+*.obj
+*.o
+*.log
+framedump.raw
+__pycache__/
+*.pyc
+
+# game-derived analysis outputs (made from your disc by the tools)
+toolkit/tools/*/output/
+!toolkit/tools/conformance/test.xbe
