@@ -39,6 +39,7 @@ typedef struct {
     volatile int fx_contrast;        /* 50..200, 100 = neutral (RECOMP_FX_CONTRAST) */
     volatile int fx_saturation;      /* 0..200, 100 = neutral (RECOMP_FX_SATURATION) */
     volatile int costume;            /* 0 = default outfit (RECOMP_COSTUME) */
+    volatile int light_prop;         /* 0 = flashlight, 1 = lantern (RECOMP_LIGHT_PROP) */
     volatile int afterimage;         /* frame-feedback crossfade: motion trails /
                                       * afterimage filter (RECOMP_AFTERIMAGE) */
     volatile int direct_move;        /* title option: left stick moves the character (SIMS_DIRECT_MOVE) */

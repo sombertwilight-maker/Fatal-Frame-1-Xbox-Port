@@ -4285,6 +4285,68 @@ static int bridge_is_cdrom_device(const char *path)
     if (_strnicmp(path, "\\??\\", 4) == 0) path += 4;
     return _stricmp(path, "\\Device\\CdRom0") == 0;
 }
+/* The XBE bakes a media-file table of { const char *name; u32 size; u32
+ * group; } records: the title takes each file's load size from this table,
+ * allocates that much and reads that much -- it never asks the file system.
+ * A costume redirect can hand it a file larger than the baked entry (the
+ * spe packs outgrow m000_miku.xpr by 43K, miku2.mpx outgrows miku.mpx by
+ * 13K), and the tail past the baked size never loads: the last texture
+ * slots sample uninitialised heap (rainbow sleeves and socks) and the part
+ * at the mesh tail is cut off (the missing left arm). Before the title
+ * sizes those buffers, grow the m000_miku.* entries to the redirect
+ * target's real size. The table is static data in the guest image: find
+ * the name string, then the record that points at it. */
+static void costume_toc_grow(const char *entry_name, const char *base,
+                             const char *ext)
+{
+    char xpath[160];
+    xbox_host_char host[MAX_PATH];
+    uint32_t nsz;
+    const uint8_t *g = (const uint8_t *)(uintptr_t)g_xbox_mem_offset;
+    const uint32_t lo = 0x10000, hi = 0x300000;
+    size_t nlen = strlen(entry_name) + 1;   /* match the NUL too */
+    uint32_t sva, va;
+
+    snprintf(xpath, sizeof xpath,
+             "\\Device\\CdRom0\\Media\\3ddata\\man\\mdl\\%s%s", base, ext);
+    if (!xbox_translate_path(xpath, host, MAX_PATH))
+        return;
+#ifdef _WIN32
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (!GetFileAttributesExW(host, GetFileExInfoStandard, &fad))
+            return;
+        nsz = fad.nFileSizeLow;
+    }
+#else
+    {
+        struct stat st;
+        if (stat(host, &st))
+            return;
+        nsz = (uint32_t)st.st_size;
+    }
+#endif
+    for (sva = lo; sva + nlen <= hi; sva++) {
+        if (memcmp(g + sva, entry_name, nlen) != 0)
+            continue;
+        /* a record pointing at this copy of the name */
+        for (va = lo & ~3u; va + 8 <= hi; va += 4) {
+            uint32_t old;
+            if (*(const uint32_t *)(g + va) != sva)
+                continue;
+            old = *(const uint32_t *)(g + va + 4);
+            if (old == 0 || old > (16u << 20))
+                continue;              /* not a size field */
+            if (nsz > old) {
+                *(uint32_t *)((uintptr_t)(va + 4) + g_xbox_mem_offset) = nsz;
+                fprintf(stderr, "  [COSTUME] toc %s: %u -> %u (%s%s)\n",
+                        entry_name, old, nsz, base, ext);
+            }
+            return;                    /* first matching record decides */
+        }
+    }
+}
+
 
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE.
  * bridge_create_file_impl, below, wraps this with the per-attempt log. */
@@ -4342,17 +4404,46 @@ static NTSTATUS bridge_create_file_open(
             { "m000_miku2", "m000_spe1" },
             { "m000_miku2", "m000_spe2" },
             { "m000_miku2", "m000_spe3" },
+            { "m000_miku2", "m000_mikujp" },  /* retextured toward the JP default */
         };
         int ci = xbox_GfxConfig()->costume;
+        int lantern = xbox_GfxConfig()->light_prop == 1;
         const char *tail = name.Buffer ? strrchr(name.Buffer, '\\') : NULL;
-        if (ci > 0 && ci < (int)(sizeof cost_base / sizeof cost_base[0])
-            && tail && _strnicmp(tail + 1, "m000_miku.", 10) == 0) {
+        if (tail && _strnicmp(tail + 1, "m000_miku.", 10) == 0
+            && (lantern || (ci > 0 && ci < (int)(sizeof cost_base / sizeof cost_base[0])))) {
+            {
+                /* Grow the baked size entries before the title sizes its
+                 * buffers: its first m000_miku.* open is the accessory
+                 * set, well before the mesh and texture pack allocate. */
+                static int toc_done;
+                if (!toc_done) {
+                    toc_done = 1;
+                    if (ci > 0 && ci < (int)(sizeof cost_base / sizeof cost_base[0])) {
+                        costume_toc_grow("m000_miku.xpr", cost_base[ci].tex, ".xpr");
+                        costume_toc_grow("m000_miku.mpx", cost_base[ci].mesh, ".mpx");
+                    }
+                    if (lantern)
+                        costume_toc_grow("m000_miku.acs", "m000_miku2", ".acs");
+                }
+            }
             static char alt[560];
             XBOX_ANSI_STRING aname;
             XBOX_OBJECT_ATTRIBUTES aoa;
             size_t head = (size_t)(tail + 1 - name.Buffer);
-            const char *base = _stricmp(tail + 10, ".xpr") == 0
-                               ? cost_base[ci].tex : cost_base[ci].mesh;
+            const char *base;
+            int valid = ci > 0 && ci < (int)(sizeof cost_base / sizeof cost_base[0]);
+            if (_stricmp(tail + 10, ".acs") == 0)
+                /* The accessory set carries the light prop: the default set
+                 * holds the flashlight and camera, miku2's holds the intro
+                 * lantern. The player chooses in the F6 menu, independent
+                 * of the outfit. */
+                base = lantern ? "m000_miku2" : NULL;
+            else
+                base = !valid ? NULL
+                     : _stricmp(tail + 10, ".xpr") == 0 ? cost_base[ci].tex
+                     : cost_base[ci].mesh;
+            if (!base)
+                goto no_redirect;
             if (head + strlen(base) + strlen(tail + 10) + 1 < sizeof alt) {
                 memcpy(alt, name.Buffer, head);
                 strcpy(alt + head, base);
@@ -4378,6 +4469,7 @@ static NTSTATUS bridge_create_file_open(
             }
         }
     }
+no_redirect:
 
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
                            file_attrs, share, disposition, options);

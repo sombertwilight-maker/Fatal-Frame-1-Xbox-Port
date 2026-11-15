@@ -403,13 +403,13 @@ static int s_menu_tab;                /* 0 display, 1 effects, 2 costumes */
 static const char *s_costumes[] = {
     "International default", "Purple outfit",
     "Street outfit A", "Street outfit B", "Street outfit C",
-    "Yukata A", "Yukata B", "Yukata C",
+    "Yukata A", "Yukata B", "Yukata C", "Japanese Miku",
 };
 #define N_COSTUMES ((int)(sizeof s_costumes / sizeof s_costumes[0]))
 
 static int menu_items_on(int tab)
 {
-    return tab == 0 ? 6 : tab == 1 ? 11 : N_COSTUMES;
+    return tab == 0 ? 6 : tab == 1 ? 11 : N_COSTUMES + 1;
 }
 
 static void menu_line(char *out, size_t cap, int item)
@@ -432,8 +432,12 @@ static void menu_line(char *out, size_t cap, int item)
         return;
     }
     if (s_menu_tab == 2) {
-        snprintf(out, cap, "%s %s", g->costume == item ? "*" : " ",
-                 item < N_COSTUMES ? s_costumes[item] : "");
+        if (item == 0)
+            snprintf(out, cap, "Light prop             %s",
+                     g->light_prop ? "Lantern" : "Flashlight");
+        else
+            snprintf(out, cap, "%s %s", g->costume == item - 1 ? "*" : " ",
+                     item - 1 < N_COSTUMES ? s_costumes[item - 1] : "");
         return;
     }
     switch (item) {
@@ -637,7 +641,10 @@ static void menu_change(int item, int dir)
         return;
     }
     if (s_menu_tab == 2) {
-        g->costume = item;
+        if (item == 0)
+            g->light_prop = !g->light_prop;
+        else
+            g->costume = item - 1;
         xbox_GfxConfigSave();
         menu_render();
         return;

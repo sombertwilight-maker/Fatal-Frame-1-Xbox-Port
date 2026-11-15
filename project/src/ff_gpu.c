@@ -138,6 +138,7 @@ XboxGfxConfig *xbox_GfxConfig(void)
         s_gfx.fx_contrast = env_int("RECOMP_FX_CONTRAST", 100);
         s_gfx.fx_saturation = env_int("RECOMP_FX_SATURATION", 100);
         s_gfx.costume = env_int("RECOMP_COSTUME", 0);
+        s_gfx.light_prop = env_int("RECOMP_LIGHT_PROP", 0);
     }
     return &s_gfx;
 }
@@ -161,9 +162,9 @@ void xbox_GfxConfigSave(void)
                                   "RECOMP_FX_GAMMA", "RECOMP_FX_VIGNETTE",
                                   "RECOMP_FX_GRAIN", "RECOMP_FX_SHARPEN",
                                   "RECOMP_FX_TEMP", "RECOMP_FX_SCANLINES",
-                                  "RECOMP_FX_CA" };
-    char vals[19][16];
-    int seen[19] = { 0 };
+                                  "RECOMP_FX_CA", "RECOMP_LIGHT_PROP" };
+    char vals[20][16];
+    int seen[20] = { 0 };
     int k;
 
     snprintf(vals[0], sizeof vals[0], "%d", s_gfx.scale);
@@ -185,6 +186,7 @@ void xbox_GfxConfigSave(void)
     snprintf(vals[16], sizeof vals[16], "%d", s_gfx.fx_temp);
     snprintf(vals[17], sizeof vals[17], "%d", s_gfx.fx_scanlines);
     snprintf(vals[18], sizeof vals[18], "%d", s_gfx.fx_ca);
+    snprintf(vals[19], sizeof vals[19], "%d", s_gfx.light_prop);
 
     snprintf(path, sizeof path, "%s\\fatalframe.ini", g_ff_root);
     snprintf(tmp, sizeof tmp, "%s\\fatalframe.ini.new", g_ff_root);
