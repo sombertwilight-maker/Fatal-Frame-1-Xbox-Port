@@ -53,13 +53,23 @@ try {
     Get-File "https://www.python.org/ftp/python/$v/python-$v-embed-amd64.zip" $zip
     Expand-Any $zip $PyDir
     Remove-Item $zip -Force
-    # the embeddable build ships with site-packages switched off
-    Get-ChildItem $PyDir -Filter 'python*._pth' | ForEach-Object {
-      (Get-Content $_.FullName) -replace '^#\s*import site', 'import site' | Set-Content $_.FullName
-    }
-    New-Item -ItemType Directory -Force -Path (Join-Path $PyDir 'Lib\site-packages') | Out-Null
     Say "ok"
   } else { Write-Host "`n[1/4] Python - already here" }
+
+  # The embeddable build is deliberately isolated: a ._pth file replaces
+  # the normal sys.path, drops the working directory and ignores
+  # PYTHONPATH. Left alone, "python -m tools.xiso" cannot see the
+  # toolkit's tools package even when run from inside it, and
+  # site-packages is off so capstone is invisible too. Write the path
+  # file we actually need.
+  New-Item -ItemType Directory -Force -Path (Join-Path $PyDir 'Lib\site-packages') | Out-Null
+  $toolkit = Join-Path $Root 'toolkit'
+  foreach ($pth in @(Get-ChildItem $PyDir -Filter 'python*._pth')) {
+    $f = $pth.FullName
+    $stdlib = @(Get-Content $f | Where-Object { $_ -match '\.zip$' })
+    $want = $stdlib + @('.', 'Lib\site-packages', $toolkit, 'import site')
+    Set-Content -Path $f -Value $want -Encoding ASCII
+  }
 
   # -------------------------------------------------------------- capstone
   $SitePkgs = Join-Path $PyDir 'Lib\site-packages'
@@ -99,7 +109,7 @@ try {
   # -------------------------------------------------------------- compiler
   $GccDir = Join-Path $Tools 'mingw'
   if ((Need 'cl') -and (Need 'gcc') -and -not (Get-ChildItem $GccDir -Filter 'gcc.exe' -Recurse -ErrorAction SilentlyContinue)) {
-    Write-Host "`n[4/4] C compiler (MinGW-w64 GCC) - this is the big one, ~150 MB"
+    Write-Host "`n[4/4] C compiler (MinGW-w64 GCC) - this is the big one"
     $a = Latest-Asset 'brechtsanders/winlibs_mingw' 'x86_64.*ucrt.*\.zip$' 'llvm|mcf' -Smallest
     $z = Join-Path $env:TEMP $a.name
     Get-File $a.browser_download_url $z
