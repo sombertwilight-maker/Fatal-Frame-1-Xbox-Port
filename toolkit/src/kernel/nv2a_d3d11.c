@@ -1863,6 +1863,19 @@ static void df_dump(void)
  * flashlight's glow accumulation buffer (807F4000) and the composited scene
  * (80428000) can be inspected frame by frame -- whether the glow is building
  * up, holding, or decaying over time. F9 triggers it. */
+/* Build L"<stem>_<va>_<tag>_f<frame>.png" widening the narrow tag by
+ * hand: swprintf's %S reads the tag as wide on some runtimes and the
+ * mojibake name then fails to open. */
+static void dump_name(wchar_t *out, size_t n, const wchar_t *stem,
+                      uint32_t va, const char *tag, uint32_t frame)
+{
+    size_t i = 0, k;
+    i += (size_t)swprintf(out + i, n - i, L"%ls_%08X_", stem, va);
+    for (k = 0; tag[k] && i + 1 < n; k++)
+        out[i++] = (wchar_t)(unsigned char)tag[k];
+    swprintf(out + i, n - i, L"_f%u.png", frame);
+}
+
 static void ds_dump_png(uint32_t va, const char *tag)
 {
     DsEnt *e = find_ds(va);
@@ -1899,7 +1912,7 @@ static void ds_dump_png(uint32_t va, const char *tag)
                     px[(size_t)y * w + x] = 0xFF000000u | (g << 16) | (g << 8) | g;
                 }
             }
-            swprintf(path, MAX_PATH, L"dsdump_%08X_%S_f%u.png", va, tag, s_frame);
+            dump_name(path, MAX_PATH, L"dsdump", va, tag, s_frame);
             png_write_rows(path, px, w, h);
             fprintf(stderr, "[DSDUMP] %08X (%s): %ux%u frame %u; depth min %u max %u (z16 %.1f..%.1f), %u texels at clear\n",
                     va, tag, w, h, s_frame, dmin, dmax, dmin / 256.0, dmax / 256.0, nclear);
@@ -1994,7 +2007,7 @@ static void rt_dump_png(uint32_t va, const char *tag)
                 memcpy(px + (size_t)y * w,
                        (const uint8_t *)m.pData + (size_t)y * m.RowPitch,
                        (size_t)w * 4);
-            swprintf(path, MAX_PATH, L"rtdump_%08X_%S_f%u.png", va, tag, s_frame);
+            dump_name(path, MAX_PATH, L"rtdump", va, tag, s_frame);
             png_write_rows(path, px, w, h);
             fprintf(stderr, "[RTDUMP] %08X (%s): wrote %ux%u at frame %u\n", va, tag, w, h, s_frame);
             free(px);
@@ -2677,6 +2690,31 @@ volatile int g_vis_verbose;
 static void d3d_draw(const Nv2aGpuState *st, const Nv2aGpuVertex *v, uint32_t count)
 {
     uint32_t done = 0;
+    /* F9: every small draw (the flare quads: save orbs, lens flares) in
+     * surface pixels, to check where the title put them against where
+     * their anchor renders. */
+    if (s_dbg.log >= 1 && count <= 8 && count >= 3) {
+        float x0 = v[0].pos[0], x1 = x0, y0 = v[0].pos[1], y1 = y0;
+        uint32_t k;
+        for (k = 1; k < count; k++) {
+            if (v[k].pos[0] < x0) x0 = v[k].pos[0];
+            if (v[k].pos[0] > x1) x1 = v[k].pos[0];
+            if (v[k].pos[1] < y0) y0 = v[k].pos[1];
+            if (v[k].pos[1] > y1) y1 = v[k].pos[1];
+        }
+        /* sprites only: a hand-sized box on the 640x480 surface */
+        if (x1 - x0 < 120.0f && y1 - y0 < 120.0f) {
+            static uint32_t lines, lframe;
+            if (lframe != s_frame) { lframe = s_frame; lines = 0; }
+            if (lines++ < 200)
+                fprintf(stderr, "  [SPRITE %u] t0 %08X %ux%u  n%u  box %.1f,%.1f..%.1f,%.1f  w %.4f\n",
+                        s_dbg.dix ? s_dbg.dix - 1 : 0,
+                        st->tex[0].valid ? st->tex[0].offset : 0,
+                        st->tex[0].valid ? st->tex[0].width : 0,
+                        st->tex[0].valid ? st->tex[0].height : 0,
+                        count, x0, y0, x1, y1, v[0].pos[3]);
+        }
+    }
 
     if (st->topo == 1 && count == 1)
         memcpy(g_d3d_last_point, v[0].pos, sizeof g_d3d_last_point);
@@ -2810,7 +2848,7 @@ static char *gen_vs(const Nv2aGpuVsh *vs, int clipd)
          "  float4 O1 = 0, O2 = 0, O3 = float4(0,0,0,1), O4 = float4(0,0,0,1), O5 = 0,\n"
          "         O6 = 0, O7 = 0, O8 = 0, O9 = float4(0,0,0,1), O10 = float4(0,0,0,1),\n"
          "         O11 = float4(0,0,0,1), O12 = float4(0,0,0,1);\n"
-         "  int a0 = 0;\n", clipd ? " float2 cd : SV_ClipDistance0;" : "");
+         "  int a0 = 0;\n", clipd ? " float3 cd : SV_ClipDistance0;" : "");
     n = vs->nins;
     for (k = 0; k < n; k++) {
         const uint32_t *w = vs->prog[k];
@@ -2878,6 +2916,20 @@ static char *gen_vs(const Nv2aGpuVsh *vs, int clipd)
         if (vf(w, 3, 0, 1))
             break;
     }
+    /* The far plane. A title parks a sprite it does not want seen just
+     * past it -- Fatal Frame's save-point glow sits at z = 1.007 when its
+     * anchor is out of view -- and counts on the hardware to throw the
+     * sprite away. Depth clipping is off here for the shadow pass's sake,
+     * so such a sprite was depth-clamped and drawn instead: a save orb
+     * hanging in the sky, in 4:3 as in widescreen. A clip distance cuts it
+     * at the far plane alone, leaving the near plane and the w <= 0 rule
+     * untouched. A little give, as the near plane has: plenty of geometry
+     * sits exactly at far. RECOMP_FAR_CLIP=0 restores the old behaviour. */
+    static int farclip = -1;
+    if (farclip < 0) {
+        const char *ef = getenv("RECOMP_FAR_CLIP");
+        farclip = !(ef && *ef == '0');
+    }
     bput(&b,
          "  VO o;\n"
          "  float4 P = R12;\n"
@@ -2894,7 +2946,10 @@ static char *gen_vs(const Nv2aGpuVsh *vs, int clipd)
           * on it (z == the viewport's z offset), and the program's rounding
           * put a corner a hair in front of it on some frames -- a random
           * letter or panel piece clipped away, the load menu's flicker. */
-         clipd ? "  o.cd = float2(wv - 1e-3, vx.y != 0 ? (P.z - vx.x + 1e-2 + abs(vx.x) * 1e-5) * wv : 1.0);\n" : "");
+         !clipd ? ""
+         : farclip ? "  o.cd = float3(wv - 1e-3, vx.y != 0 ? (P.z - vx.x + 1e-2 + abs(vx.x) * 1e-5) * wv : 1.0,\n"
+                     "                (1.0 + 1e-3 - P.z * vp.z) * wv);\n"
+         : "  o.cd = float3(wv - 1e-3, vx.y != 0 ? (P.z - vx.x + 1e-2 + abs(vx.x) * 1e-5) * wv : 1.0, 1.0);\n");
     return b.p;
 }
 
