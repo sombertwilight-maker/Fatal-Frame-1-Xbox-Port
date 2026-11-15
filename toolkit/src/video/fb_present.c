@@ -420,9 +420,12 @@ static void menu_line(char *out, size_t cap, int item)
     case 4:
         snprintf(out, cap, "FPS counter            %s", g->show_fps ? "On" : "Off");
         break;
+    case 5:
+        snprintf(out, cap, "Afterimage filter      %s", g->afterimage ? "On" : "Off");
+        break;
     }
 }
-#define MENU_ITEMS 5
+#define MENU_ITEMS 6
 
 static void menu_render(void)
 {
@@ -579,6 +582,9 @@ static void menu_change(int item, int dir)
         break;
     case 4:
         g->show_fps = !g->show_fps;
+        break;
+    case 5:
+        g->afterimage = !g->afterimage;
         break;
     }
     g->fullscreen = s_fullscreen;

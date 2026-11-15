@@ -33,6 +33,7 @@
 #include <d3dcompiler.h>
 #include <wincodec.h>
 #include <objbase.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -40,6 +41,7 @@
 #include <string.h>
 
 #include "nv2a_backend.h"
+#include "nv2a_vsh_interp.h"
 #include "video/gfx_config.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -110,7 +112,7 @@ static ID3DBlob *compile(const char *src, const char *entry, const char *target)
  * pixels; the shader maps it to clip space keeping w, so the GPU interpolates
  * perspective-correct as the software path does. */
 static const char s_vs_src[] =
-    "cbuffer V : register(b0) { float4 vp; };\n"
+    "cbuffer V : register(b0) { float4 vp; float4 vx; };\n"
     "struct VI { float4 p : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1;\n"
     "  float fog : FOG; float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
     "  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3; };\n"
@@ -119,6 +121,7 @@ static const char s_vs_src[] =
     "  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3; };\n"
     "PI vs(VI i) { PI o; float w = i.p.w;\n"
     "  float x = i.p.x * vp.x - 1.0, y = 1.0 - i.p.y * vp.y, z = i.p.z * vp.z;\n"
+    "  x *= (vx.z != 0 && abs(w - 1.0) > 1e-4) ? vx.z : 1.0;\n"
     "  o.p = float4(x * w, y * w, z * w, w);\n"
     "  o.d0 = i.d0; o.d1 = i.d1; o.fog = i.fog;\n"
     "  o.t0 = i.t0; o.t1 = i.t1; o.t2 = i.t2; o.t3 = i.t3; return o; }\n";
@@ -157,6 +160,9 @@ typedef struct {
     uint32_t kind[4];        /* 0 unbound (reads white), 1 2D, 2 cube, 3 shadow map */
     uint32_t shadow_func;    /* SET_SHADOW_COMPARE_FUNC, for kind 3 */
     uint32_t swap_rb[4];     /* texture reads a render target in the other order */
+    uint32_t force_a1[4];    /* alphaless format (X8R8G8B8): reads alpha 1, not
+                              * the target's leftover alpha -- the bloom pass
+                              * alpha-tests what it reads back and vanished */
     uint32_t alpha_test, alpha_func;
     uint32_t dbg;            /* RECOMP_GPU_DEBUG experiments */
 } PsKey;
@@ -267,8 +273,9 @@ static char *gen_ps(const PsKey *k)
         bput(&b, "  o = i.d0;\n");
         if (k->textured) {
             if (k->kind[0] == 1)
-                bput(&b, "  { float4 t = T0.Sample(S0, i.t0.xy * TS[0].xy);%s o *= t; }\n",
-                     k->swap_rb[0] ? " t.rgb = t.bgr;" : "");
+                bput(&b, "  { float4 t = T0.Sample(S0, i.t0.xy * TS[0].xy);%s%s o *= t; }\n",
+                     k->swap_rb[0] ? " t.rgb = t.bgr;" : "",
+                     k->force_a1[0] ? " t.a = 1;" : "");
         }
         bput(&b, "  o = saturate(o);\n");
     } else {
@@ -314,18 +321,44 @@ static char *gen_ps(const PsKey *k)
                          * RECOMP_SHADOW_SWAP=1 swaps the operands. */
                         static const char *ops[8] = { "", "<", "==", "<=", ">", "!=", ">=", "" };
                         static int swap = -1;
+                        static double rscale = -1.0;
                         if (swap < 0) {
                             const char *e = getenv("RECOMP_SHADOW_SWAP");
                             swap = e && *e == '1';
                         }
+                        if (rscale < 0) {
+                            /* Diagnostic scale on r only (not the x/y
+                             * lookup); 1.0 is correct -- earlier 2x readings
+                             * came from a shadow map corrupted by negative-w
+                             * clipping, fixed in the vertex epilogue. */
+                            const char *e = getenv("RECOMP_SHADOW_RSCALE");
+                            rscale = e && *e ? atof(e) : 1.0;  /* the F9
+                                     * pairing probe shows the title renders
+                                     * receivers into the map so reference ==
+                                     * stored exactly; no scale is right */
+                            if (rscale <= 0) rscale = 1.0;
+                        }
+                        {
+                            /* The title asks for +200 Z16 units of polygon
+                             * offset on the shadow pass plus a slope term;
+                             * applied here on the reference so the compare
+                             * carries it even where the rasterizer's bias
+                             * cannot (RECOMP_SHADOW_RBIAS, Z16 units). */
+                            static double rbias = -1.0;
+                            if (rbias < 0) {
+                                const char *e2 = getenv("RECOMP_SHADOW_RBIAS");
+                                rbias = e2 && *e2 ? atof(e2) : 1000.0;
+                                if (rbias < 0) rbias = 0;
+                            }
                         bput(&b, "  { float q = %s.w != 0 ? %s.w : 1; float zm = 1.0 / TS[%d].z;\n"
-                                 "    float r = clamp(%s.z / q, 0, zm); float2 dim; T%d.GetDimensions(dim.x, dim.y);\n"
+                                 "    float r = clamp(%s.z / q * %f - %f, 0, zm); float2 dim; T%d.GetDimensions(dim.x, dim.y);\n"
                                  "    float2 p = %s.xy / q * TS[%d].xy * dim - 0.5, f = frac(p);\n"
                                  "    int2 i0 = clamp(int2(floor(p)), int2(0,0), int2(dim) - 1);\n"
                                  "    int2 i1 = clamp(int2(floor(p)) + 1, int2(0,0), int2(dim) - 1);\n"
                                  "    float4 d = float4(T%d.Load(int3(i0.x, i0.y, 0)).r, T%d.Load(int3(i1.x, i0.y, 0)).r,\n"
                                  "                      T%d.Load(int3(i0.x, i1.y, 0)).r, T%d.Load(int3(i1.x, i1.y, 0)).r) * zm;\n",
-                             tc, tc, st, tc, st, tc, st, st, st, st, st);
+                             tc, tc, st, tc, (float)rscale, (float)rbias, st, tc, st, st, st, st, st);
+                        }
                         /* The surface stores whole depth units (Z16 on the
                          * console; 24 bits here) and the hardware compares
                          * in them: a surface tested against its own depth
@@ -361,9 +394,11 @@ static char *gen_ps(const PsKey *k)
                     bput(&b, "    t%d = T%d.Sample(S%d, float3(%s.xy / q, 1));", st, st, st, tc);
                 else
                     bput(&b, "    t%d = T%d.Sample(S%d, %s.xy / q * TS[%d].xy);", st, st, st, tc, st);
-                bput(&b, "%s }\n", k->swap_rb[st] ? (st == 0 ? " t0.rgb = t0.bgr;" :
+                bput(&b, "%s%s }\n", k->swap_rb[st] ? (st == 0 ? " t0.rgb = t0.bgr;" :
                                                      st == 1 ? " t1.rgb = t1.bgr;" :
-                                                     st == 2 ? " t2.rgb = t2.bgr;" : " t3.rgb = t3.bgr;") : "");
+                                                     st == 2 ? " t2.rgb = t2.bgr;" : " t3.rgb = t3.bgr;") : "",
+                     k->force_a1[st] ? (st == 0 ? " t0.a = 1;" : st == 1 ? " t1.a = 1;" :
+                                        st == 2 ? " t2.a = 1;" : " t3.a = 1;") : "");
                 break;
             case 3:
                 if (!k->kind[st]) { bput(&b, "  t%d = 1;\n", st); break; }
@@ -479,16 +514,50 @@ static char *gen_ps(const PsKey *k)
             if (dl == 9) bput(&b, "  o = float4(saturate((shdbg.x - shdbg.y) / 64 + 0.5), saturate(shdbg.y / 65535), saturate(shdbg.x / 65535), 1);\n");
             if (dl == 10) bput(&b, "  { float q2 = i.t2.w != 0 ? i.t2.w : 1; o = float4(saturate(i.t2.xy / q2 / 256), saturate(i.t2.z / q2 / 65535), 1); }\n");
             if (dl == 11) bput(&b, "  { float q2 = i.t2.w != 0 ? i.t2.w : 1; float rr = i.t2.z / q2; o = float4(saturate(rr / 262144), saturate(rr / 131072), saturate(rr / 524288), 1); }\n");
+            /* 12: the law of the mismatch. shdbg = (r as compared, stored d,
+             * raw tc.z/q, tc.w); r carries RECOMP_SHADOW_RSCALE, so x2 undoes
+             * the current 0.5 and rat is the RAW reference over stored.
+             * R: rat/4. G: frac(rat), bands that let the value be read off.
+             * B: stored depth. A flat color across a wall receding in depth
+             * means a pure constant; a drift with distance means the depth
+             * laws differ (one side divided by w, or offset). */
+            if (dl == 12) bput(&b, "  { float rat = shdbg.y > 0 ? shdbg.x * 2 / shdbg.y : 0; o = float4(saturate(rat * 0.25), frac(rat), saturate(shdbg.y / 65535), 1); }\n");
+            /* 13: the same ratio divided by the texcoord's q. Flat R at 1
+             * with B rising along the beam means rat tracks q, confirming a
+             * missing or extra w-divide between the two depths. */
+            if (dl == 13) bput(&b, "  { float rat = shdbg.y > 0 ? shdbg.x * 2 / shdbg.y : 0; float qq = shdbg.w != 0 ? shdbg.w : 1; o = float4(saturate(rat / qq), frac(rat / qq * 4), saturate(qq / 8), 1); }\n");
             if (dl == 7) bput(&b, "  o = float4(frac(i.t2.xyz / (i.t2.w != 0 ? i.t2.w : 1) * float3(TS[2].xy, TS[2].z)), 1);\n");
+            /* 14: the compare's verdict per pixel: green where the shadow
+             * test passes (lit), red where it fails, blue the reference. */
+            if (dl == 14) bput(&b, "  o = float4(1 - t2.x, t2.x, saturate(shdbg.x / 65535), 1);\n");
+            /* 15: the margin. shdbg.y is the sampled stored depth, shdbg.x
+             * the compared reference. Green: passes by 0..4096 units (full
+             * green = 4096 or more). Red: fails by 0..4096. Blue: frac of
+             * margin/512, fine bands to read the value. */
+            if (dl == 15) bput(&b, "  { float mg = shdbg.y - shdbg.x; o = float4(saturate(-mg / 4096), saturate(mg / 4096), frac(abs(mg) / 512), 1); }\n");
             if (dl == 8) bput(&b, "  o = float4(T2.SampleLevel(S2l, i.t2.xy / (i.t2.w != 0 ? i.t2.w : 1) * TS[2].xy, 0).rrr, 1);\n");
+            /* 16: the three gates of the lit beam at once -- R the cookie
+             * (t0 luminance), G the attenuation (t1 alpha), B the shadow
+             * compare (t2). Where the beam should be but is black, the dark
+             * channel names the culprit. */
+            if (dl == 16) bput(&b, "  o = float4(dot(t0.rgb, 0.3333), t1.a, t2.x, 1);\n");
         }
     }
     if (k->alpha_test) {
-        const char *op = cmp_op(k->alpha_func);
-        if (k->alpha_func == 0x200)
-            bput(&b, "  discard;\n");
-        else if (op)
-            bput(&b, "  if (!((int)(o.a * 255.0 + 0.5) %s AREF.x)) discard;\n", op);
+        static int noat = -1;
+        if (noat < 0) {
+            const char *e = getenv("RECOMP_BEAM_NOAT");
+            noat = e && *e == '1';
+        }
+        if (noat && k->kind[2] == 3) {
+            /* Diagnostic: the beam pass survives without its alpha test. */
+        } else {
+            const char *op = cmp_op(k->alpha_func);
+            if (k->alpha_func == 0x200)
+                bput(&b, "  discard;\n");
+            else if (op)
+                bput(&b, "  if (!((int)(o.a * 255.0 + 0.5) %s AREF.x)) discard;\n", op);
+        }
     }
     bput(&b, "  return o;\n}\n");
     return b.p;
@@ -545,6 +614,10 @@ typedef struct {
     uint32_t gh;                       /* rows the title used since the last readback */
     uint32_t shown_pitch;              /* pitch it was last flipped to the screen with */
     ID3D11Texture2D *stage;            /* 1x staging copy for readback */
+    uint64_t gm_hash;                  /* sparse hash of the guest memory under
+                                        * the surface when it was last written:
+                                        * changed memory means the title reused
+                                        * the address for something else */
 } RtEnt;
 
 static uint32_t s_scale = 1;             /* internal resolution, applied */
@@ -583,6 +656,40 @@ static int make_rt(RtEnt *e, uint32_t w, uint32_t h)
 }
 
 static void k_reset(void);
+/* The byte range a surface's guest-memory hash covers: one rule for every
+ * site, or the same bytes hash differently and the compare is noise. */
+static uint32_t rt_gm_range(const RtEnt *e)
+{
+    uint32_t bytes = e->pitch ? e->pitch * e->h : e->w * e->h * 4;
+    return bytes > 0x400000u ? 0x400000u : bytes;
+}
+
+/* 64 samples across the guest bytes under a surface. */
+static uint64_t rt_gm_hash(uint32_t va, uint32_t bytes)
+{
+    const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset() + va;
+    uint64_t h = 1469598103934665603ull;
+    uint32_t k, step = bytes > 256 ? bytes / 64 : 4;
+    for (k = 0; k + 4 <= bytes; k += step) {
+        h ^= *(const uint32_t *)(m + k);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+/* Lifecycle trace of one surface (the glow feedback buffer), capped. */
+static uint32_t s_trace_va = 0x807F4000u;
+static int s_trace_n;
+enum { RT_TRACE_CAP = 200 };
+#define RT_TRACE(va, ...) do { \
+        if ((va) == s_trace_va && s_trace_n < RT_TRACE_CAP) { \
+            s_trace_n++; \
+            fprintf(stderr, "[RTLIFE] frame %u: ", s_frame); \
+            fprintf(stderr, __VA_ARGS__); \
+            fputc('\n', stderr); \
+        } \
+    } while (0)
+
 static void free_rt(RtEnt *e)
 {
     k_reset();
@@ -1521,6 +1628,8 @@ static int bind_surface(const Nv2aGpuState *st, int want_depth, const uint32_t r
     s_vcb_data[0] = 2.0f / (float)rt->w;
     s_vcb_data[1] = 2.0f / (float)rt->h;
     s_vcb_data[2] = 1.0f / (st->zeta_bits == 16 ? 65535.0f : 16777215.0f);
+    /* the widescreen factor survives the wipe: every path reads it */
+    s_vcb_data[6] = xbox_GfxConfig()->widescreen ? 0.75f : 0.0f;
     k_vcb(s_vcb_data);
     s_cur_rt = rt;
     if (ds_out) *ds_out = ds;
@@ -1717,6 +1826,138 @@ static void flash_dump(int which, uint32_t frame)
 }
 /* frame and draw index for other files' event logs */
 uint32_t nv2a_d3d_mark(void) { return (s_frame << 10) | (s_dbg.dix & 0x3FFu); }
+
+/* DEPTH_FUNC change trace. The stencil-fin pass that carves the flashlight
+ * beam needs depth func LEQUAL (0x203); after a room change it has been seen
+ * stuck at ALWAYS (0x207), which destroys the carve and kills the beam for
+ * good. This records every change, tagged with frame and draw index, into a
+ * ring so the last few seconds survive however long the title has run; F9
+ * dumps the ring. The pattern across a transition shows whether the per-frame
+ * "set back to 0x203 before the fins" write is still arriving afterwards or
+ * has gone missing (a sticky-state loss at a scan seam). */
+#define DF_RING 4096
+static struct { uint32_t frame, draw, oldv, newv; } s_df_ring[DF_RING];
+static unsigned s_df_head, s_df_count;
+void nv2a_note_depthfunc(uint32_t oldv, uint32_t newv)
+{
+    unsigned i = s_df_head;
+    s_df_ring[i].frame = s_frame;
+    s_df_ring[i].draw  = s_dbg.dix & 0x3FFu;
+    s_df_ring[i].oldv  = oldv;
+    s_df_ring[i].newv  = newv;
+    s_df_head = (i + 1) % DF_RING;
+    if (s_df_count < DF_RING) s_df_count++;
+}
+static void df_dump(void)
+{
+    unsigned n = s_df_count;
+    unsigned i = (s_df_head + DF_RING - n) % DF_RING;
+    fprintf(stderr, "[DF] dumping last %u depth-func changes (oldest first):\n", n);
+    for (; n; n--, i = (i + 1) % DF_RING)
+        fprintf(stderr, "[DF] frame %u draw %u: %03X -> %03X\n",
+                s_df_ring[i].frame, s_df_ring[i].draw,
+                s_df_ring[i].oldv, s_df_ring[i].newv);
+}
+
+/* Dump a render target's current pixels to a PNG beside the exe, so the
+ * flashlight's glow accumulation buffer (807F4000) and the composited scene
+ * (80428000) can be inspected frame by frame -- whether the glow is building
+ * up, holding, or decaying over time. F9 triggers it. */
+static void ds_dump_png(uint32_t va, const char *tag)
+{
+    DsEnt *e = find_ds(va);
+    D3D11_TEXTURE2D_DESC td, sd;
+    ID3D11Texture2D *stg = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t w, h, y, x;
+    wchar_t path[MAX_PATH];
+    if (!e || !e->t) {
+        fprintf(stderr, "[DSDUMP] %08X (%s): no live DS entry\n", va, tag);
+        return;
+    }
+    ID3D11Texture2D_GetDesc(e->t, &td);
+    w = td.Width; h = td.Height;
+    memset(&sd, 0, sizeof sd);
+    sd.Width = w; sd.Height = h; sd.MipLevels = 1; sd.ArraySize = 1;
+    sd.Format = td.Format; sd.SampleDesc.Count = 1;
+    sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(ID3D11Device_CreateTexture2D(D, &sd, NULL, &stg))) {
+        fprintf(stderr, "[DSDUMP] %08X (%s): staging create failed\n", va, tag);
+        return;
+    }
+    ID3D11DeviceContext_CopyResource(C, (ID3D11Resource *)stg, (ID3D11Resource *)e->t);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(C, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m))) {
+        uint32_t *px = (uint32_t *)malloc((size_t)w * h * 4);
+        uint32_t dmin = 0xFFFFFF, dmax = 0, nclear = 0;
+        if (px) {
+            for (y = 0; y < h; y++) {
+                const uint32_t *row = (const uint32_t *)((const uint8_t *)m.pData + (size_t)y * m.RowPitch);
+                for (x = 0; x < w; x++) {
+                    uint32_t d = row[x] & 0xFFFFFFu, g = d >> 16;
+                    if (d == 0xFFFFFFu || d == 0) nclear++;
+                    else { if (d < dmin) dmin = d; if (d > dmax) dmax = d; }
+                    px[(size_t)y * w + x] = 0xFF000000u | (g << 16) | (g << 8) | g;
+                }
+            }
+            swprintf(path, MAX_PATH, L"dsdump_%08X_%S_f%u.png", va, tag, s_frame);
+            png_write_rows(path, px, w, h);
+            fprintf(stderr, "[DSDUMP] %08X (%s): %ux%u frame %u; depth min %u max %u (z16 %.1f..%.1f), %u texels at clear\n",
+                    va, tag, w, h, s_frame, dmin, dmax, dmin / 256.0, dmax / 256.0, nclear);
+            free(px);
+        }
+        ID3D11DeviceContext_Unmap(C, (ID3D11Resource *)stg, 0);
+    } else {
+        fprintf(stderr, "[DSDUMP] %08X (%s): map failed\n", va, tag);
+    }
+    ID3D11Texture2D_Release(stg);
+}
+
+static void rt_dump_png(uint32_t va, const char *tag)
+{
+    RtEnt *e = find_rt(va);
+    D3D11_TEXTURE2D_DESC td, sd;
+    ID3D11Texture2D *stg = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t *px, w, h, y;
+    wchar_t path[MAX_PATH];
+    if (!e || !e->t) {
+        fprintf(stderr, "[RTDUMP] %08X (%s): no live RT entry\n", va, tag);
+        return;
+    }
+    ID3D11Texture2D_GetDesc(e->t, &td);
+    w = td.Width; h = td.Height;
+    memset(&sd, 0, sizeof sd);
+    sd.Width = w; sd.Height = h; sd.MipLevels = 1; sd.ArraySize = 1;
+    sd.Format = td.Format; sd.SampleDesc.Count = 1;
+    sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(ID3D11Device_CreateTexture2D(D, &sd, NULL, &stg))) {
+        fprintf(stderr, "[RTDUMP] %08X (%s): staging create failed\n", va, tag);
+        return;
+    }
+    ID3D11DeviceContext_CopyResource(C, (ID3D11Resource *)stg, (ID3D11Resource *)e->t);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(C, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m))) {
+        px = (uint32_t *)malloc((size_t)w * h * 4);
+        if (px) {
+            for (y = 0; y < h; y++)
+                memcpy(px + (size_t)y * w,
+                       (const uint8_t *)m.pData + (size_t)y * m.RowPitch,
+                       (size_t)w * 4);
+            swprintf(path, MAX_PATH, L"rtdump_%08X_%S_f%u.png", va, tag, s_frame);
+            png_write_rows(path, px, w, h);
+            fprintf(stderr, "[RTDUMP] %08X (%s): wrote %ux%u at frame %u\n", va, tag, w, h, s_frame);
+            free(px);
+        }
+        ID3D11DeviceContext_Unmap(C, (ID3D11Resource *)stg, 0);
+    } else {
+        fprintf(stderr, "[RTDUMP] %08X (%s): map failed\n", va, tag);
+    }
+    ID3D11Texture2D_Release(stg);
+}
+uint32_t g_comp_frame_count;    /* draws into the glow back buffer this frame */
+uint32_t g_glow_target_sets;    /* times the guest set RT = glow buffer this
+                                 * frame (from the pushbuffer executor) */
+uint32_t g_glow_tex_binds;      /* times the guest bound the accumulation
+                                 * buffer 807F4000 as a texture this frame */
 uint32_t g_sig_cur[2048], g_tex_cur[2048];
 static uint32_t s_sig[3][2048], s_tex3[3][2048];
 extern volatile int g_vis_verbose;
@@ -1739,6 +1980,94 @@ static void dbg_poll(void)
         s_dbg.log = 2;
         g_vis_verbose = 240;
         fprintf(stderr, "[F9] frame %u: listing the next frame's draws (scale %d)\n", s_frame, s_scale);
+        df_dump();
+        rt_dump_png(0x807F4000u, "accum");   /* glow accumulation buffer */
+        rt_dump_png(0x80428000u, "bufA");    /* framebuffer A */
+        rt_dump_png(0x80554000u, "bufB");    /* framebuffer B (glow composite) */
+        ds_dump_png(0x80E57000u, "shadow");  /* flashlight shadow map */
+        /* The flashlight cookie: decode the 64x64 A8 at its home address
+         * straight from guest memory, with brightness centroid, so a dump
+         * shows what the beam spot looks like and where it sits. */
+        {
+            Nv2aGpuTexture ct;
+            static uint32_t cbuf[64 * 64];
+            memset(&ct, 0, sizeof ct);
+            ct.offset = 0x80E97000u;
+            ct.width = 64; ct.height = 64; ct.color = 0x19; ct.levels = 1;
+            if (nv2a_gpu_decode_texture(&ct, 0, cbuf)) {
+                uint32_t x2, y2;
+                double sa = 0, sx = 0, sy = 0; uint32_t amax = 0;
+                static uint32_t px2[64 * 64];
+                wchar_t cp[MAX_PATH];
+                for (y2 = 0; y2 < 64; y2++)
+                    for (x2 = 0; x2 < 64; x2++) {
+                        uint32_t a2 = cbuf[y2 * 64 + x2] >> 24;
+                        px2[y2 * 64 + x2] = 0xFF000000u | (a2 << 16) | (a2 << 8) | a2;
+                        sa += a2; sx += (double)a2 * x2; sy += (double)a2 * y2;
+                        if (a2 > amax) amax = a2;
+                    }
+                swprintf(cp, MAX_PATH, L"cookie_f%u.png", s_frame);
+                png_write_rows(cp, px2, 64, 64);
+                fprintf(stderr, "[COOKIE] 80E97000 frame %u: max %u avg %.1f centroid %.1f %.1f (of 64)\n",
+                        s_frame, amax, sa / 4096.0, sa > 0 ? sx / sa : -1, sa > 0 ? sy / sa : -1);
+            } else {
+                fprintf(stderr, "[COOKIE] decode failed\n");
+            }
+        }
+        {
+            extern uint32_t xbox_GetDisplayFramebuffer(uint32_t *);
+            uint32_t p = 0, fb = xbox_GetDisplayFramebuffer(&p);
+            fprintf(stderr, "[F9] presented/scanout buffer = %08X (pitch %u)\n", fb, p);
+        }
+    }
+
+    /* Flashlight glow-composite death watch. g_comp_frame_count holds the
+     * previous frame's count of passes that paint the orb (they sample the
+     * accumulation buffer 807F4000). Once those have run reliably for a while
+     * and then stop for good, log the exact frame -- so it can be lined up
+     * against the [WRAP] ring-wrap events and the stage-program history to
+     * see what the game lost. Also a periodic pulse so the taper is visible. */
+    {
+        extern void xbox_pb_stageprog_dump(void);
+        static unsigned live_frames, dead_run, died_at, last_pulse;
+        static int was_live, announced;
+        /* g_comp_frame_count = draws that reached our pipeline targeting the
+         * glow buffer; g_glow_target_sets = times the guest ASKED for it in
+         * the pushbuffer. The two together localize the death: if the guest
+         * stops asking, it is guest-side; if it keeps asking but no draws
+         * land, we are dropping them. */
+        /* Death is keyed on the accumulation-buffer binds: those are the orb
+         * composite reads, the thing that actually stops. Alongside it, the
+         * RT=glow sets show the guest's render loop is otherwise unchanged. */
+        if (g_glow_tex_binds > 2) {
+            live_frames++; dead_run = 0;
+            if (live_frames > 120) was_live = 1;
+        } else {
+            if (dead_run == 0) died_at = s_frame;
+            dead_run++;
+            if (was_live && !announced && dead_run > 30) {
+                announced = 1;
+                fprintf(stderr, "[COMPWATCH] orb composite (807F4000 binds) DIED at frame %u "
+                        "(was live %u frames, now dead %u). That frame: %u accumulation-binds, "
+                        "%u RT=glow sets, %u draws into 80554000. => %s\n",
+                        died_at, live_frames, dead_run,
+                        g_glow_tex_binds, g_glow_target_sets, g_comp_frame_count,
+                        g_glow_tex_binds > 2 ? "still bound"
+                        : (g_glow_target_sets > 0 ? "GUEST STILL RENDERS GLOW PHASE but stopped binding accumulation (our drop OR guest gate)"
+                                                  : "guest stopped glow phase entirely"));
+                xbox_pb_stageprog_dump();
+            }
+        }
+        if (s_frame - last_pulse >= 120) {
+            last_pulse = s_frame;
+            fprintf(stderr, "[COMPWATCH] frame %u: %u accumulation-binds, %u RT=glow sets, "
+                    "%u draws->80554000 (live %u dead %u)\n",
+                    s_frame, g_glow_tex_binds, g_glow_target_sets, g_comp_frame_count,
+                    live_frames, dead_run);
+        }
+        g_comp_frame_count = 0;
+        g_glow_target_sets = 0;
+        g_glow_tex_binds = 0;
     }
     if (s_dbg.on > 0 && GetFileAttributesA("gpulogall") != INVALID_FILE_ATTRIBUTES) {
         /* while a file named gpulogall exists beside the exe: every frame */
@@ -1812,10 +2141,10 @@ static void dbg_log(uint32_t dix, const Nv2aGpuState *st, const PsKey *key)
  * lit/unlit checkerboard that reads as no light at all. */
 static ID3D11RasterizerState *rs_for(const Nv2aRenderState *rs)
 {
-    static struct { int bias, cull, ccw; float slope; ID3D11RasterizerState *st; } cache[32];
+    static struct { int bias, cull, ccw, clamp; float slope; ID3D11RasterizerState *st; } cache[32];
     static int n, logged, mode = -2;
     D3D11_RASTERIZER_DESC rd;
-    int bias = 0, i, cull = 0, ccw = 0;
+    int bias = 0, i, cull = 0, ccw = 0, clamp = 0;
     float slope = 0.0f;
 
     /* RECOMP_GPU_CULL: 1 (default) honours SET_CULL_FACE as the title sets
@@ -1849,11 +2178,32 @@ static ID3D11RasterizerState *rs_for(const Nv2aRenderState *rs)
         bias = (int)(rs->poly_units * (rs->zeta_fmt == 1 ? 256.0f : 1.0f));
         slope = rs->poly_factor * (float)s_scale;
     }
-    if (!cull && !bias && slope == 0.0f)
+    /* A depth-only pass into a Z16 surface -- the flashlight's shadow map --
+     * stores geometry past the far plane saturated at 65535 on the console
+     * (a Z16 write clamps).  D3D's far clip removed those fragments, leaving
+     * holes the beam read as occluders.  Depth clamp restores the console's
+     * writes; the w<=0 clip and the title's near plane are unaffected. */
+    if (rs->zeta_fmt == 1 && rs->color_mask == 0 && rs->depth_write) {
+        clamp = 1;
+        /* RECOMP_SHADOW_CULL: 1 (default) the title's cull as mapped above,
+         * 2 the opposite face, 0 both faces. The map should hold each ray's
+         * EXIT from solid geometry (back faces), so lit surfaces compare
+         * against the far side, not themselves. */
+        static int scull = -1;
+        if (scull < 0) {
+            const char *e = getenv("RECOMP_SHADOW_CULL");
+            scull = e && *e ? atoi(e) : 1;
+        }
+        if (scull == 2 && (cull == 1 || cull == 2))
+            cull = cull == 1 ? 2 : 1;
+        else if (scull == 0)
+            cull = 0;
+    }
+    if (!cull && !bias && slope == 0.0f && !clamp)
         return s_rs;
     for (i = 0; i < n; i++)
         if (cache[i].bias == bias && cache[i].slope == slope
-            && cache[i].cull == cull && cache[i].ccw == ccw)
+            && cache[i].cull == cull && cache[i].ccw == ccw && cache[i].clamp == clamp)
             return cache[i].st;
     if (n == 32)
         return s_rs;
@@ -1875,8 +2225,18 @@ static ID3D11RasterizerState *rs_for(const Nv2aRenderState *rs)
     return cache[n++].st;
 }
 
+static int s_draw_samples_rt;   /* this draw reads a render target */
+static uint32_t s_glow_fb, s_glow_blits;   /* feedback draws and frame blits
+                                            * since the last [GLOW] report */
+static uint32_t s_glow_blitfail;           /* blits refused (and the target
+                                            * entry freed) since the report */
+static uint32_t s_glow_plain;              /* full-screen feedback-sized
+                                            * textures sampled WITHOUT an RT
+                                            * entry: the broken state */
+
 static int setup_pixels(const Nv2aGpuState *st)
 {
+    s_draw_samples_rt = 0;
     const Nv2aRenderState *rs = &st->rs;
     uint32_t rect[4];
     DsEnt *ds = NULL;
@@ -1889,6 +2249,9 @@ static int setup_pixels(const Nv2aGpuState *st)
     float bf[4];
     int i, need_depth;
     uint32_t dix = s_dbg.dix++;
+    if (st->color_va == 0x80554000u)
+        g_comp_frame_count++;   /* a draw into the glow-composite back buffer;
+                                 * when these stop, the orb is dead. */
     if (dix < 2048) {
         {
             /* the white-box event, caught in the act: many textured draws
@@ -1965,6 +2328,31 @@ static int setup_pixels(const Nv2aGpuState *st)
             continue;
         linear = st->bilinear || mag == 2 || min == 2 || min == 4 || min == 6;
         rt = t->cube ? NULL : find_rt(t->offset);
+        if (rt && s_frame - rt->used > 2) {
+            /* An entry nothing has written for a while. If the guest bytes
+             * under it still read as they did when it was last written, the
+             * title has not touched the memory and the copy on the GPU is
+             * the surface's truth (a pause screen sampling an old frame).
+             * Changed bytes mean the title reused the address -- usually
+             * for an ordinary texture -- and sampling the old target fed
+             * draws framebuffer leftovers instead: the flashlight's glow
+             * died for good at the first room change. */
+            uint64_t now = rt_gm_hash(rt->va, rt_gm_range(rt));
+            if (!rt->gm_hash) {
+                RT_TRACE(t->offset, "stale sample, baseline hash %016llX (used frame %u)",
+                         (unsigned long long)now, rt->used);
+                rt->gm_hash = now;      /* a drawn-to target: baseline on the
+                                         * first stale hit, compare after */
+            } else if (now != rt->gm_hash) {
+                RT_TRACE(t->offset, "stale sample, memory changed %016llX -> %016llX (used frame %u): entry dropped",
+                         (unsigned long long)rt->gm_hash, (unsigned long long)now, rt->used);
+                free_rt(rt);
+                memset(rt, 0, sizeof *rt);
+                rt = NULL;
+            } else {
+                RT_TRACE(t->offset, "stale sample, memory unchanged: kept (used frame %u)", rt->used);
+            }
+        }
         if (!rt && t->color >= 0x2A && t->color <= 0x31) {
             DsEnt *dz = find_ds(t->offset);
             if (dz && dz->srv && (!ds || dz != ds)) {
@@ -1997,12 +2385,27 @@ static int setup_pixels(const Nv2aGpuState *st)
                 continue;
             }
         }
+        if (!rt && t->width >= 512 && t->height >= 384
+            && (t->color == 0x07 || t->color == 0x1E || t->color == 0x3A || t->color == 0x3F)) {
+            /* A frame-sized linear surface sampled with no live RT entry:
+             * the feedback chain lost its buffer and is reading stale guest
+             * memory -- the dead-flashlight state. */
+            static unsigned said2;
+            s_glow_plain++;
+            if (said2 < 20) {
+                said2++;
+                fprintf(stderr, "[GLOW] frame %u draw %u: %ux%u f%02X at %08X sampled as a plain texture (no RT entry)\n",
+                        s_frame, s_dbg.dix, t->width, t->height, t->color, t->offset);
+            }
+        }
         if (rt) {
             /* Render-to-texture: sample the target itself. Its texels hold
              * A8R8G8B8 as drawn; a texture read in the reverse order swaps. */
             srv[i] = rt->srv;
+            s_draw_samples_rt = 1;
             key.kind[i] = 1;
             key.swap_rb[i] = (t->color == 0x3A || t->color == 0x3F);
+            key.force_a1[i] = (t->color == 0x07 || t->color == 0x1E);
             if (t->normalized) {
                 pc.ts[i][0] = (float)t->width / (float)rt->w;
                 pc.ts[i][1] = (float)t->height / (float)rt->h;
@@ -2064,6 +2467,15 @@ static int setup_pixels(const Nv2aGpuState *st)
         }
         smp[i] = get_ss(linear, t->addr_u, t->addr_v, t->border, t->border_color != 0);
     }
+    /* Afterimage filter off: skip the frame-feedback crossfade, the pass
+     * that blends the previously accumulated frame back over the new one
+     * with the constant-alpha blend and leaves motion trails on the player
+     * and the ghosts. The additive bloom and the flashlight orb blend with
+     * ONE, not constant alpha, so they stay. */
+    if (!xbox_GfxConfig()->afterimage && rs->blend_enable
+        && rs->blend_src == 0x8003 && rs->blend_dst == 0x8004
+        && s_draw_samples_rt)
+        return 0;
     key.dbg = s_dbg.flags & 3;
     if ((s_dbg.flags & 8) && st->use_rc && !(st->rc.stage_program & 0x7FFF)) return 0;
     key.alpha_test = rs->alpha_test_enable;
@@ -2148,6 +2560,31 @@ static int setup_pixels(const Nv2aGpuState *st)
         if (!K.valid || K.rs_ptr != want) {
             ID3D11DeviceContext_RSSetState(C, want);
             K.rs_ptr = want;
+        }
+    }
+    {
+        /* Widescreen: a draw that samples a render target is the game
+         * re-drawing its own frame (the miasma veil, heat haze). The frame
+         * already spans the full target, so this draw keeps the identity
+         * mapping; squeezed, the copy lands offset against the live scene
+         * -- a double image.
+         *
+         * A draw into a sub-screen offscreen target (the flashlight's
+         * 256x256 shadow map, and any other small intermediate buffer) must
+         * also keep the identity mapping. The squeeze is a screen-aspect
+         * correction; applied to a light-space shadow map it shifts the map's
+         * x against the light-matrix texture coordinates the beam samples it
+         * with -- which our x-only squeeze never touches -- so the cone
+         * collapses to a thin line and the glow dies. The screen targets are
+         * 640 wide; anything narrower is not the screen. */
+        int offscreen_small = s_cur_rt && s_cur_rt->w < 512;
+        float ws = (!s_draw_samples_rt && !offscreen_small
+                    && xbox_GfxConfig()->widescreen) ? 0.75f : 0.0f;
+        if (s_draw_samples_rt)
+            s_glow_fb++;
+        if (s_vcb_data[6] != ws) {
+            s_vcb_data[6] = ws;
+            k_vcb(s_vcb_data);
         }
     }
     return 1;
@@ -2520,6 +2957,178 @@ static int d3d_draw_vsh(const Nv2aGpuState *st, const Nv2aGpuVsh *vs,
             fprintf(stderr, " ]");
         }
         fprintf(stderr, "\n");
+        /* Full-precision vertex-program outputs for the dumped frame: the
+         * shadow pass's stored depth is oPos.z, the lit pass's shadow
+         * reference is oT2.z/oT2.w; printing both for real vertices pins
+         * the depth law numerically instead of from screenshots. */
+        if (vs->stride >= 64)
+            for (v2 = 0; v2 < nverts && v2 < 3; v2++) {
+                Nv2aVshOutput vo2;
+                if (nv2a_vsh_run((const float (*)[4])(in + v2 * vs->stride), &vo2))
+                    fprintf(stderr, "  [VSHRUN %u] pos %.4f %.4f %.6f %.6f t0 %.4f %.4f %.4f %.4f t1 %.4f %.4f %.4f %.4f t2 %.6f %.6f %.6f %.6f\n",
+                            v2, vo2.pos[0], vo2.pos[1], vo2.pos[2], vo2.pos[3],
+                            vo2.tex[0][0], vo2.tex[0][1], vo2.tex[0][2], vo2.tex[0][3],
+                            vo2.tex[1][0], vo2.tex[1][1], vo2.tex[1][2], vo2.tex[1][3],
+                            vo2.tex[2][0], vo2.tex[2][1], vo2.tex[2][2], vo2.tex[2][3]);
+            }
+        /* Shadow-law pairing: collect every shadow-pass vertex as a point in
+         * light-map space (map x, map y, stored z, clip w), then for each
+         * lit-pass vertex that samples the shadow map, find the nearest
+         * collected point and print both sides.  Same map position means
+         * same surface, so stored-vs-reference pairs fall out exactly. */
+        if (vs->stride >= 64) {
+            static float smp2[4096][4];
+            static int   smn2, smpr;
+            static uint32_t smfr = ~0u;
+            int shadow_pass = st->zeta_bits == 16;
+            int lit_pass = 0, ti;
+            for (ti = 0; ti < 4 && !lit_pass; ti++)
+                if (st->tex[ti].valid && st->tex[ti].color >= 0x2A && st->tex[ti].color <= 0x31
+                    && st->zeta_bits != 16)
+                    lit_pass = 1;
+            if (smfr != s_frame) { smfr = s_frame; smn2 = 0; smpr = 0; }
+            if (shadow_pass) {
+                for (v2 = 0; v2 < nverts && smn2 < 4096; v2++) {
+                    Nv2aVshOutput vo2;
+                    if (nv2a_vsh_run((const float (*)[4])(in + v2 * vs->stride), &vo2)) {
+                        smp2[smn2][0] = vo2.pos[0]; smp2[smn2][1] = vo2.pos[1];
+                        smp2[smn2][2] = vo2.pos[2]; smp2[smn2][3] = vo2.pos[3];
+                        smn2++;
+                    }
+                }
+                fprintf(stderr, "  [SMPROBE] collected %d shadow verts\n", smn2);
+            } else if (lit_pass && smn2) {
+                /* One staging read of the live shadow map per dump frame, so
+                 * each pair also shows the texel the GPU will compare with. */
+                static uint32_t *gmap; static uint32_t gw, gh, gfr = ~0u;
+                if (gfr != s_frame) {
+                    DsEnt *de = find_ds(0x80E57000u);
+                    gfr = s_frame; gw = gh = 0;
+                    if (de && de->t) {
+                        D3D11_TEXTURE2D_DESC td2, sd2;
+                        ID3D11Texture2D *stg2 = NULL;
+                        D3D11_MAPPED_SUBRESOURCE m2;
+                        ID3D11Texture2D_GetDesc(de->t, &td2);
+                        memset(&sd2, 0, sizeof sd2);
+                        sd2.Width = td2.Width; sd2.Height = td2.Height;
+                        sd2.MipLevels = 1; sd2.ArraySize = 1;
+                        sd2.Format = td2.Format; sd2.SampleDesc.Count = 1;
+                        sd2.Usage = D3D11_USAGE_STAGING; sd2.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        if (SUCCEEDED(ID3D11Device_CreateTexture2D(D, &sd2, NULL, &stg2))) {
+                            ID3D11DeviceContext_CopyResource(C, (ID3D11Resource *)stg2, (ID3D11Resource *)de->t);
+                            if (SUCCEEDED(ID3D11DeviceContext_Map(C, (ID3D11Resource *)stg2, 0, D3D11_MAP_READ, 0, &m2))) {
+                                uint32_t yy;
+                                gw = td2.Width; gh = td2.Height;
+                                gmap = (uint32_t *)realloc(gmap, (size_t)gw * gh * 4);
+                                for (yy = 0; yy < gh; yy++)
+                                    memcpy(gmap + (size_t)yy * gw,
+                                           (const uint8_t *)m2.pData + (size_t)yy * m2.RowPitch,
+                                           (size_t)gw * 4);
+                                ID3D11DeviceContext_Unmap(C, (ID3D11Resource *)stg2, 0);
+                                fprintf(stderr, "  [SMGPU] staged live shadow map %ux%u\n", gw, gh);
+                                /* Self-check: every collected shadow vertex
+                                 * against the texel it rasterised into.  A
+                                 * systematic deficit here means the write
+                                 * path, not the lookup, carries the error. */
+                                {
+                                    int i3, nprint = 0, nok = 0, nlo = 0, nhi = 0;
+                                    double dsum = 0; float dmn = 1e30f, dmx = -1e30f;
+                                    for (i3 = 0; i3 < smn2; i3++) {
+                                        float vx2 = smp2[i3][0], vy2 = smp2[i3][1], vz2 = smp2[i3][2];
+                                        int gx3 = (int)(vx2 * s_scale), gy3 = (int)(vy2 * s_scale);
+                                        float gz3, df;
+                                        if (vx2 < 0 || vy2 < 0 || vx2 > 256 || vy2 > 256) continue;
+                                        if (gx3 < 0 || gy3 < 0 || (uint32_t)gx3 >= gw || (uint32_t)gy3 >= gh) continue;
+                                        if (vz2 < 0 || vz2 > 65535) continue;
+                                        gz3 = (float)(gmap[(size_t)gy3 * gw + gx3] & 0xFFFFFFu) / 256.0f;
+                                        df = gz3 - vz2;      /* + means map deeper (bias) */
+                                        /* the texel may belong to a nearer surface; count only
+                                         * roughly-matching ones for the bias statistic */
+                                        if (df > -400 && df < 3000) { nok++; dsum += df; if (df < dmn) dmn = df; if (df > dmx) dmx = df; }
+                                        else if (df <= -400) nlo++;
+                                        else nhi++;
+                                        if (nprint < 10 && (i3 % 97) == 0) {
+                                            fprintf(stderr, "  [SMSELF] vert %.2f %.2f z %.1f | gpu %.1f diff %.1f\n",
+                                                    vx2, vy2, vz2, gz3, df);
+                                            nprint++;
+                                        }
+                                    }
+                                    fprintf(stderr, "  [SMSELF] verts matching own texel (+bias window): %d, diff avg %.1f min %.1f max %.1f; nearer-surface %d, farther %d\n",
+                                            nok, nok ? dsum / nok : 0.0, dmn, dmx, nlo, nhi);
+                                }
+                            }
+                            ID3D11Texture2D_Release(stg2);
+                        }
+                    }
+                }
+                {
+                    int dpr = 0;
+                    float rmin = 1e30f, rmax = -1e30f;
+                    int inmap = 0, nlit = 0, ndark = 0;
+                {
+                    static int pdone;
+                    if (!pdone && st->tex[0].valid && st->tex[0].palette) {
+                        const uint32_t *pal2 = (const uint32_t *)(gmem() + st->tex[0].palette);
+                        int i4, n255 = 0, n0 = 0;
+                        for (i4 = 0; i4 < 256; i4++) {
+                            uint32_t a4 = pal2[i4] >> 24;
+                            if (a4 == 0xFF) n255++; else if (!a4) n0++;
+                        }
+                        fprintf(stderr, "  [PAL0] tex %08X palette %08X alpha: ff x%d, 00 x%d, first4 %08X %08X %08X %08X\n",
+                                st->tex[0].offset, st->tex[0].palette, n255, n0,
+                                pal2[0], pal2[1], pal2[2], pal2[3]);
+                        pdone = 1;
+                    }
+                }
+                for (v2 = 0; v2 < nverts && smpr < 240; v2++) {
+                    Nv2aVshOutput vo2;
+                    if (!nv2a_vsh_run((const float (*)[4])(in + v2 * vs->stride), &vo2))
+                        continue;
+                    {
+                        float q = vo2.tex[2][3];
+                        float mx, my, ref;
+                        int bi = -1, i2;
+                        float bd = 16.0f;         /* 4px radius, squared */
+                        if (q < 1e-3f && q > -1e-3f) continue;
+                        mx = vo2.tex[2][0] / q; my = vo2.tex[2][1] / q;
+                        ref = vo2.tex[2][2] / q;
+                        if (mx < 0 || mx > 256 || my < 0 || my > 256) continue;
+                        inmap++;
+                        if (ref < rmin) rmin = ref;
+                        if (ref > rmax) rmax = ref;
+                        if (gmap && gw) {
+                            int gx2 = (int)(mx * s_scale), gy2 = (int)(my * s_scale);
+                            if (gx2 >= 0 && gy2 >= 0 && (uint32_t)gx2 < gw && (uint32_t)gy2 < gh) {
+                                float gz2 = (float)(gmap[(size_t)gy2 * gw + gx2] & 0xFFFFFFu) / 256.0f;
+                                if (gz2 >= ref) nlit++; else ndark++;
+                            }
+                        }
+                        if (dpr >= 8) continue;
+                        for (i2 = 0; i2 < smn2; i2++) {
+                            float dx = smp2[i2][0] - mx, dy = smp2[i2][1] - my;
+                            float d2 = dx * dx + dy * dy;
+                            if (d2 < bd) { bd = d2; bi = i2; }
+                        }
+                        if (bi >= 0) {
+                            float gz = -1;
+                            if (gmap && gw) {
+                                int gx = (int)(mx * s_scale), gy = (int)(my * s_scale);
+                                if (gx >= 0 && gy >= 0 && (uint32_t)gx < gw && (uint32_t)gy < gh)
+                                    gz = (float)(gmap[(size_t)gy * gw + gx] & 0xFFFFFFu) / 256.0f;
+                            }
+                            fprintf(stderr, "  [SMPAIR] map %.2f %.2f ref %.2f q %.3f | vert %.2f vw %.3f | gpu %.2f %s\n",
+                                    mx, my, ref, q, smp2[bi][2], smp2[bi][3], gz,
+                                    gz >= 0 ? (gz >= ref ? "LIT" : "dark") : "?");
+                            smpr++; dpr++;
+                        }
+                    }
+                }
+                    if (inmap)
+                        fprintf(stderr, "  [SMSTAT] %d verts in map, ref %.0f..%.0f, verdict lit %d dark %d\n",
+                                inmap, rmin, rmax, nlit, ndark);
+                }
+            }
+        }
     }
     /* Constants: re-uploaded only when they changed. */
     if (!s_kcb_valid || memcmp(s_kcb_data, vs->consts, sizeof s_kcb_data)) {
@@ -2916,6 +3525,9 @@ static void rt_readback(RtEnt *e)
 
     if (!e->t || !e->dirty || e->swizzled || !e->pitch || (e->bpp != 4 && e->bpp != 2))
         return;
+    if ((e->va & 0x0FFFFFFFu) < 0x00010000u)
+        return;                  /* the shadow pass's dummy surface sits at
+                                  * physical 0: never write that back */
     if (e->pitch != e->shown_pitch) {
         /* Only what reaches the screen is copied back: the front and back
          * buffers, which the CPU reads (photos). Offscreen targets -- a
@@ -3033,6 +3645,17 @@ static int d3d_blit(uint32_t src_va, uint32_t src_pitch, uint32_t dst_va, uint32
     (void)src_pitch;
     if (!src || src->swizzled || src_va == dst_va || !w || !h
         || (src->bpp && src->bpp != bpp)) {
+        RT_TRACE(dst_va, "blit refused (src %s %ux%u): dst entry freed",
+                 !src ? "missing" : src->swizzled ? "swizzled" : "bad", w, h);
+        static unsigned said;
+        s_glow_blitfail++;
+        if (said < 40) {
+            said++;
+            fprintf(stderr, "[GLOW] blit refused: %08X -> %08X %ux%u (%s); target entry freed\n",
+                    src_va, dst_va, w, h,
+                    !src ? "src not a target" : src->swizzled ? "src swizzled"
+                    : src_va == dst_va ? "same surface" : !w || !h ? "empty" : "bpp mismatch");
+        }
         dst = find_rt(dst_va);
         if (dst) free_rt(dst);
         return 0;
@@ -3055,6 +3678,9 @@ static int d3d_blit(uint32_t src_va, uint32_t src_pitch, uint32_t dst_va, uint32
     ID3D11DeviceContext_CopySubresourceRegion(C, (ID3D11Resource *)dst->t, 0,
                                               dx * s_scale, dy * s_scale, 0,
                                               (ID3D11Resource *)src->t, 0, &box);
+    dst->used = s_frame;
+    dst->gm_hash = rt_gm_hash(dst->va, rt_gm_range(dst));
+    s_glow_blits++;
     /* Not marked for copying back: the title blits its frame aside to sample
      * it (glow, afterimage), which stays on the GPU; copying the 1.2 MB back
      * at every fence was most of the cost of the fence sync. */
@@ -3273,6 +3899,20 @@ static void apply_gfx_settings(void)
                 640 * s_scale, 480 * s_scale);
     }
     g->scale_applied = (int)s_scale;
+    {
+        /* The glow pipeline's pulse, once every ~5 s: how many draws since
+         * the last report sampled a render target (the afterglow, bloom and
+         * veil passes) and how many frame blits fed them. Zeroes here while
+         * the flashlight looks dead mean the title stopped issuing them. */
+        static uint32_t last;
+        if (s_frame - last >= 300) {
+            fprintf(stderr, "[GLOW] frame %u: %u rt-sampling draws, %u frame blits, %u blit refusals, %u plain-texture reads in the last %u frames\n",
+                    s_frame, s_glow_fb, s_glow_blits, s_glow_blitfail, s_glow_plain, s_frame - last);
+            last = s_frame;
+            s_glow_fb = s_glow_blits = 0;
+            s_glow_blitfail = s_glow_plain = 0;
+        }
+    }
     /* Widescreen: perspective draws squeeze x by 3/4 in the render target
      * and the window stretches 4:3 to 16:9 -- net: the same proportions
      * with a third more world at the sides (Hor+). Screen-space draws
@@ -3396,8 +4036,24 @@ static uint32_t d3d_occlusion_end(void)
     }
     if (FAILED(hr))
         return 0;
-    if (s_scale > 1)
-        n /= (UINT64)s_scale * s_scale;
+    if (s_scale > 1) {
+        /* Ceiling, not floor. The title's visibility tests draw single-pixel
+         * points (ghosts in the viewfinder, lens flares): one point is one
+         * host sample at ANY internal resolution, and 1/scale^2 floored to 0
+         * read as "never visible" -- the Camera Obscura stopped detecting
+         * ghosts the moment the internal resolution went above 1x. Any
+         * surviving sample must report at least one title pixel; larger
+         * areas still scale back proportionally. */
+        UINT64 ss = (UINT64)s_scale * s_scale;
+        UINT64 scaled = (n + ss - 1) / ss;
+        static int nlog;
+        if (n && nlog < 60) {
+            fprintf(stderr, "[VIS] raw %llu -> %llu (scale %d)\n",
+                    (unsigned long long)n, (unsigned long long)scaled, s_scale);
+            nlog++;
+        }
+        n = scaled;
+    }
     return n > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)n;
 }
 

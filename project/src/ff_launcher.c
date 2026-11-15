@@ -352,10 +352,13 @@ static void set_runtime_defaults(void)
                                                  * the renderer's copy-back writing
                                                  * pixels into DirectSound's memory,
                                                  * fixed since. */
-    default_env("RECOMP_FLASH_LOG", "1");      /* diagnostic: log the glare/full-screen
+    default_env("RECOMP_FLASH_LOG", "0");      /* diagnostic: log the glare/full-screen
                                                  * draws of any frame whose brightness
-                                                 * suddenly jumps (the white flashes);
-                                                 * 0 turns it off */
+                                                 * suddenly jumps. Off by default: it
+                                                 * reads every presented frame back
+                                                 * from the GPU, which costs real
+                                                 * frame time at high internal
+                                                 * resolutions. 1 turns it on. */
     default_env("RECOMP_VM_FIXED", "0x01000000:0x153A000");
                                                 /* the game reserves its 21 MB working
                                                  * pool at 0x01000000 and uses that

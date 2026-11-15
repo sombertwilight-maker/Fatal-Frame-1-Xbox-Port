@@ -4766,6 +4766,11 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         /* A DMA-object offset like a surface's: physical, reached through
          * the contiguous window when it names contiguous memory. */
         t->offset = dma_resolve(param);
+        if (stage == 0 && t->offset == 0x807F4000u) {
+            extern uint32_t g_glow_tex_binds;   /* guest bound the orb's
+                                                 * accumulation buffer to read */
+            g_glow_tex_binds++;
+        }
         break;
     case NV097_SET_TEXTURE_FORMAT:
         t->color = (param >> 8) & 0xFF;
@@ -5085,6 +5090,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         *r = param;
         return;
     }
+    if (method == 0x0000 && subch != 0) {
+        /* SET_OBJECT: the title rebinds what class lives on this
+         * subchannel. The 2D-blit routing below assumes the XDK's boot
+         * binding (NV062 on 3, NV09F on 2); a rebinding at a room change
+         * is what silently stops the frame blits -- log it. */
+        static uint32_t cur[8];
+        static unsigned said_obj;
+        if (cur[subch & 7] != param && said_obj < 24) {
+            said_obj++;
+            fprintf(stderr, "[GPU] subchannel %u object -> %08X (was %08X)\n",
+                    subch, param, cur[subch & 7]);
+        }
+        cur[subch & 7] = param;
+        return;
+    }
     if (subch == 3 && method >= 0x0300 && method <= 0x030C) {
         s_s2d[(method - 0x0300) / 4] = param;   /* NV062: format, pitch, src, dst */
         return;
@@ -5126,6 +5146,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_SURFACE_COLOR_OFFSET:
         if (s_ftrace == 2)
             fprintf(stderr, "[FTRACE] color offset -> %08X%c", param, 10);
+        if (param == 0x554000u) {        /* the glow-composite back buffer */
+            extern uint32_t g_glow_target_sets;
+            g_glow_target_sets++;
+        }
         s_gpu.color_offset = param;
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
@@ -5155,9 +5179,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * off. Keep a short history of every write so the event can be
          * read back: value, where in the ring it was decoded, and the
          * draw count at that point. */
-        if (xbox_pb_stageprog_log_on()) {
+        {
             extern uint32_t nv2a_d3d_mark(void);
-            xbox_pb_stageprog_note(param, nv2a_d3d_mark());
+            xbox_pb_stageprog_note(param, nv2a_d3d_mark());  /* always record */
         }
         s_gpu.rc.stage_program = param;
         break;
@@ -5501,7 +5525,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     /* Depth. */
     case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
-    case 0x0354: s_gpu.depth_func = param; break; /* DEPTH_FUNC */
+    case 0x0354:                                  /* DEPTH_FUNC */
+        if (param != s_gpu.depth_func) {
+            extern void nv2a_note_depthfunc(uint32_t, uint32_t);
+            nv2a_note_depthfunc(s_gpu.depth_func, param);
+        }
+        s_gpu.depth_func = param;
+        break;
     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */

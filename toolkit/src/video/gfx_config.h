@@ -27,6 +27,8 @@ typedef struct {
     volatile int widescreen;         /* 16:9: wider 3D FOV, stretched present (RECOMP_WIDESCREEN) */
     volatile int window_w, window_h; /* saved client size (RECOMP_WINDOW_W/H) */
     volatile int fullscreen;         /* borderless fullscreen (RECOMP_FULLSCREEN) */
+    volatile int afterimage;         /* frame-feedback crossfade: motion trails /
+                                      * afterimage filter (RECOMP_AFTERIMAGE) */
     volatile int direct_move;        /* title option: left stick moves the character (SIMS_DIRECT_MOVE) */
     /* reported by the back end */
     volatile int gpu_active;         /* 0: software renderer (no scaling) */

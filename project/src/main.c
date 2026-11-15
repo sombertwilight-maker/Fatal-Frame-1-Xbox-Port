@@ -344,6 +344,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     /* Find, extract and verify the player's own disc image; set defaults. */
     ff_prepare(lpCmdLine);
+    {
+        char xp[1024];
+        DWORD xn = GetModuleFileNameA(NULL, xp, sizeof xp);
+        fprintf(stderr, "[BUILD] %s %s exe %s\n", __DATE__, __TIME__, xn ? xp : "?");
+    }
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */

@@ -125,6 +125,7 @@ XboxGfxConfig *xbox_GfxConfig(void)
         s_gfx.window_w = env_int("RECOMP_WINDOW_W", 0);
         s_gfx.window_h = env_int("RECOMP_WINDOW_H", 0);
         s_gfx.fullscreen = env_int("RECOMP_FULLSCREEN", 0) != 0;
+        s_gfx.afterimage = env_int("RECOMP_AFTERIMAGE", 1) != 0;
     }
     return &s_gfx;
 }
@@ -141,9 +142,10 @@ void xbox_GfxConfigSave(void)
     FILE *f;
     static const char *keys[] = { "RECOMP_GPU_SCALE", "RECOMP_WIDESCREEN",
                                   "RECOMP_SHOW_FPS", "RECOMP_WINDOW_W",
-                                  "RECOMP_WINDOW_H", "RECOMP_FULLSCREEN" };
-    char vals[6][16];
-    int seen[6] = { 0 };
+                                  "RECOMP_WINDOW_H", "RECOMP_FULLSCREEN",
+                                  "RECOMP_AFTERIMAGE" };
+    char vals[7][16];
+    int seen[7] = { 0 };
     int k;
 
     snprintf(vals[0], sizeof vals[0], "%d", s_gfx.scale);
@@ -152,6 +154,7 @@ void xbox_GfxConfigSave(void)
     snprintf(vals[3], sizeof vals[3], "%d", s_gfx.window_w);
     snprintf(vals[4], sizeof vals[4], "%d", s_gfx.window_h);
     snprintf(vals[5], sizeof vals[5], "%d", s_gfx.fullscreen ? 1 : 0);
+    snprintf(vals[6], sizeof vals[6], "%d", s_gfx.afterimage ? 1 : 0);
 
     snprintf(path, sizeof path, "%s\\fatalframe.ini", g_ff_root);
     snprintf(tmp, sizeof tmp, "%s\\fatalframe.ini.new", g_ff_root);
@@ -179,7 +182,7 @@ void xbox_GfxConfigSave(void)
             char *nl = strchr(line, '\n');
             size_t ll = nl ? (size_t)(nl - line) + 1 : strlen(line);
             int replaced = 0;
-            for (k = 0; k < 6; k++) {
+            for (k = 0; k < (int)(sizeof keys / sizeof keys[0]); k++) {
                 size_t kl = strlen(keys[k]);
                 if (!strncmp(line, keys[k], kl) && line[kl] == '=') {
                     fprintf(f, "%s=%s\n", keys[k], vals[k]);
@@ -195,7 +198,7 @@ void xbox_GfxConfigSave(void)
         if (len && text[len - 1] != '\n')
             fputc('\n', f);
     }
-    for (k = 0; k < 6; k++)
+    for (k = 0; k < (int)(sizeof keys / sizeof keys[0]); k++)
         if (!seen[k])
             fprintf(f, "%s=%s\n", keys[k], vals[k]);
     fclose(f);
