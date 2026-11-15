@@ -5,6 +5,8 @@
 #
 #   powershell -ExecutionPolicy Bypass -File tools\bootstrap.ps1
 param([string]$Root = (Split-Path -Parent $PSScriptRoot))
+if ($Root) { $Root = $Root.Trim('"').TrimEnd('\') }
+if (-not $Root) { $Root = Split-Path -Parent $PSScriptRoot }
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # the progress bar makes downloads ~10x slower
 $Tools = Join-Path $Root 'tools'

@@ -18,6 +18,8 @@ set "GEN=!HERE!project\src\recomp\gen"
 set "OUT=!HERE!project\build\Release\fatalframe.exe"
 set "OUT2=!HERE!project\build\fatalframe.exe"
 if not exist "!HERE!work" mkdir "!HERE!work"
+set "ROOT=!HERE!"
+if "!ROOT:~-1!"=="\" set "ROOT=!ROOT:~0,-1!"
 
 echo.
 echo   Fatal Frame - native Windows
@@ -51,7 +53,7 @@ echo.
 echo   Fetching the build tools ^(first run only^).
 echo   About 200 MB from python.org, PyPI, Kitware and winlibs.
 echo   This takes a few minutes; it never happens again.
-powershell -NoProfile -ExecutionPolicy Bypass -File "!HERE!tools\bootstrap.ps1" "!HERE!"
+powershell -NoProfile -ExecutionPolicy Bypass -File "!HERE!tools\bootstrap.ps1" -Root "!ROOT!"
 if errorlevel 1 (
   echo.
   echo   Could not fetch the build tools. If this machine is offline or
