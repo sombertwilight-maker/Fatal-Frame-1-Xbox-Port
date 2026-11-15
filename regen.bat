@@ -7,7 +7,7 @@ rem PYTHON lets a caller pass the interpreter it found; py -3 by default
 if "%PYTHON%"=="" set PYTHON=py -3
 set HERE=%~dp0
 set ISO=%~1
-if "%ISO%"=="" ( echo usage: regen.bat ^<Fatal Frame (USA) iso^> & exit /b 1 )
+if "%ISO%"=="" ( echo usage: regen.bat ^<disc image^> & exit /b 1 )
 set WORK=%HERE%work
 if not exist "%WORK%" mkdir "%WORK%"
 pushd "%HERE%toolkit"
