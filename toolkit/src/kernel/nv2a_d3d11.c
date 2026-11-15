@@ -44,6 +44,12 @@
 #include "nv2a_vsh_interp.h"
 #include "video/gfx_config.h"
 
+/* This file is the D3D11 backend and does not include kernel.h; the one
+ * kernel function its diagnostics call is declared here, matching the
+ * prototype in src/kernel/kernel.h. Calling it implicitly built with older
+ * compilers and is an error from GCC 14 on. */
+extern unsigned long xbox_GuestCpuOwner(void);  /* holder's tid, 0 when free */
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static ID3D11Device        *D;

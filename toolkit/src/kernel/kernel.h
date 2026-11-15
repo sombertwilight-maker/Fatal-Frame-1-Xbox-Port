@@ -833,6 +833,11 @@ typedef struct {
 } XboxGuestCpuStats;
 void     xbox_GuestCpuStatsGet(XboxGuestCpuStats *out, int reset);
 void     xbox_GuestCpuReport(void);     /* the [GUEST] line, once per 600 vblanks */
+/* Defined in kernel_guest_cpu.c and called from kernel_bridge.c and
+ * kernel_thread.c. It was only ever declared by a local extern inside
+ * the latter, so the bridge called it implicitly -- which GCC 14 and
+ * newer reject outright rather than warn about. */
+void     xbox_GuestCpuNotePriority(unsigned long tid, int prio);
 
 /* ============================================================================
  * Synchronization (kernel_sync.c)

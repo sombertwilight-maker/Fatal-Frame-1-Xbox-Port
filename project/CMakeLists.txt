@@ -29,6 +29,14 @@ add_compile_definitions(
 # Option B: find_package (if you install xboxrecomp system-wide)
 #   find_package(xboxrecomp REQUIRED)
 #
+# An implicit declaration is a warning on older compilers and a hard error
+# from GCC 14 on, so the developer builds happily and a player on a newer
+# toolchain cannot build at all. Promote it here, before the toolkit is
+# added, so it fails on the machine that can fix it.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(-Werror=implicit-function-declaration)
+endif()
+
 # Where the toolkit lives. It is "toolkit" in this repository and in a
 # release, and "xboxrecomp" in a plain clone of it beside the project, so
 # look for both rather than making one layout the only one that builds.
