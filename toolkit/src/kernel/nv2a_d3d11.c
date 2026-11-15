@@ -1651,8 +1651,8 @@ static void d3d_clear(const Nv2aGpuState *st, uint32_t flags, uint32_t argb,
         return;
     S.clears++;
     if (s_clear_log)
-        fprintf(stderr, "  [CLEAR] rt %08X flags %02X argb %08X rect %u,%u..%u,%u\n",
-                st->color_va, flags, argb, rect[0], rect[1], rect[2], rect[3]);
+        fprintf(stderr, "  [CLEAR] rt %08X flags %02X argb %08X zs %08X rect %u,%u..%u,%u\n",
+                st->color_va, flags, argb, zs, rect[0], rect[1], rect[2], rect[3]);
     if ((flags & 0xF0) && s_cur_rt)
         s_cur_rt->dirty = 1;
     if (flags & 0x10) mask |= D3D11_COLOR_WRITE_ENABLE_BLUE;
@@ -1912,6 +1912,58 @@ static void ds_dump_png(uint32_t va, const char *tag)
     ID3D11Texture2D_Release(stg);
 }
 
+/* The stencil plane of a 24-bit depth buffer, as a picture: the title's
+ * foreground-prop ghosting marks pixels in stencil and redraws through an
+ * EQUAL test, so a wrong mask shows up here as a blob where there should
+ * be only the prop's opaque texels. 0 is black; each other value gets a
+ * bright step. The log line gives the histogram. */
+static void st_dump_png(DsEnt *e)
+{
+    D3D11_TEXTURE2D_DESC td, sd;
+    ID3D11Texture2D *stg = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t w, h, y, x, hist[256];
+    wchar_t path[MAX_PATH];
+    if (!e || !e->t)
+        return;
+    ID3D11Texture2D_GetDesc(e->t, &td);
+    if (td.Format != DXGI_FORMAT_R24G8_TYPELESS)
+        return;                      /* Z16 has no stencil plane */
+    w = td.Width; h = td.Height;
+    memset(&sd, 0, sizeof sd);
+    sd.Width = w; sd.Height = h; sd.MipLevels = 1; sd.ArraySize = 1;
+    sd.Format = td.Format; sd.SampleDesc.Count = 1;
+    sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(ID3D11Device_CreateTexture2D(D, &sd, NULL, &stg)))
+        return;
+    ID3D11DeviceContext_CopyResource(C, (ID3D11Resource *)stg, (ID3D11Resource *)e->t);
+    memset(hist, 0, sizeof hist);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(C, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m))) {
+        uint32_t *px = (uint32_t *)malloc((size_t)w * h * 4);
+        if (px) {
+            for (y = 0; y < h; y++) {
+                const uint32_t *row = (const uint32_t *)((const uint8_t *)m.pData + (size_t)y * m.RowPitch);
+                for (x = 0; x < w; x++) {
+                    uint32_t sv = row[x] >> 24;
+                    uint32_t g = sv == 0 ? 0 : 64 + (sv * 48) % 192;
+                    hist[sv]++;
+                    px[(size_t)y * w + x] = 0xFF000000u | (g << 16) | (g << 8) | g;
+                }
+            }
+            swprintf(path, MAX_PATH, L"stdump_%08X_f%u.png", e->va, s_frame);
+            png_write_rows(path, px, w, h);
+            fprintf(stderr, "[STDUMP] %08X: %ux%u frame %u; stencil", e->va, w, h, s_frame);
+            for (x = 0; x < 256; x++)
+                if (hist[x])
+                    fprintf(stderr, " [%u]=%u", x, hist[x]);
+            fputc('\n', stderr);
+            free(px);
+        }
+        ID3D11DeviceContext_Unmap(C, (ID3D11Resource *)stg, 0);
+    }
+    ID3D11Texture2D_Release(stg);
+}
+
 static void rt_dump_png(uint32_t va, const char *tag)
 {
     RtEnt *e = find_rt(va);
@@ -1985,6 +2037,15 @@ static void dbg_poll(void)
         rt_dump_png(0x80428000u, "bufA");    /* framebuffer A */
         rt_dump_png(0x80554000u, "bufB");    /* framebuffer B (glow composite) */
         ds_dump_png(0x80E57000u, "shadow");  /* flashlight shadow map */
+        {
+            int di;
+            for (di = 0; di < 16; di++)
+                if (s_ds[di].t) {
+                    st_dump_png(&s_ds[di]);
+                    if (s_ds[di].va != 0x80E57000u)
+                        ds_dump_png(s_ds[di].va, "main");
+                }
+        }
         /* The flashlight cookie: decode the 64x64 A8 at its home address
          * straight from guest memory, with brightness centroid, so a dump
          * shows what the beam spot looks like and where it sits. */
@@ -2501,6 +2562,24 @@ static int setup_pixels(const Nv2aGpuState *st)
             if (noz && (key.kind[1] == 3 || key.kind[2] == 3)) dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
         }
         dd.DepthWriteMask = rs->depth_write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+        /* The title's relight and ghosting passes redraw geometry the frame
+         * has already laid down, gated on a stencil mark (flashlight beam
+         * cone, foreground-prop ghosting), with z-write left on. On NV2A the
+         * redraw lands on bit-identical depth, so the write is harmless; here
+         * the relight vertex path can land a hair nearer than the first
+         * pass, and the stray depth then rejects the characters drawn after
+         * it (the doll room hid Miku below the beam cone's footprint). The
+         * redraw's depth is redundant by construction: drop the write. */
+        {
+            static int nozw = -1;
+            if (nozw < 0) {
+                const char *e = getenv("RECOMP_RELIGHT_NOZW");
+                nozw = !(e && *e == '0');
+            }
+            if (nozw && rs->stencil_enable && rs->stencil_func == 0x202
+                && rs->blend_enable && rs->depth_func == 0x203 && rs->depth_write)
+                dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        }
         if (rs->stencil_enable) {
             dd.StencilEnable = TRUE;
             dd.StencilReadMask = (UINT8)rs->stencil_func_mask;

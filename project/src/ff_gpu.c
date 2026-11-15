@@ -139,6 +139,7 @@ XboxGfxConfig *xbox_GfxConfig(void)
         s_gfx.fx_saturation = env_int("RECOMP_FX_SATURATION", 100);
         s_gfx.costume = env_int("RECOMP_COSTUME", 0);
         s_gfx.light_prop = env_int("RECOMP_LIGHT_PROP", 0);
+        s_gfx.tex_dump = env_int("RECOMP_TEX_DUMP", 0);
     }
     return &s_gfx;
 }
