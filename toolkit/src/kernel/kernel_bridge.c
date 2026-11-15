@@ -4337,7 +4337,7 @@ static void costume_toc_grow(const char *entry_name, const char *base,
             old = *(const uint32_t *)(g + va + 4);
             if (old == 0 || old > (16u << 20))
                 continue;              /* not a size field */
-            if (nsz > old) {
+            if (nsz != old) {
                 *(uint32_t *)((uintptr_t)(va + 4) + g_xbox_mem_offset) = nsz;
                 fprintf(stderr, "  [COSTUME] toc %s: %u -> %u (%s%s)\n",
                         entry_name, old, nsz, base, ext);
@@ -4405,6 +4405,21 @@ static NTSTATUS bridge_create_file_open(
             { "m000_miku2", "m000_spe2" },
             { "m000_miku2", "m000_spe3" },
             { "m000_miku2", "m000_mikujp" },  /* retextured toward the JP default */
+            /* Outfits lifted from the NPC models. Kazuko (m007) and the
+             * assistant (m004) ship as .mdl -- one pack holding a texture
+             * set and a nested pack of mesh parts -- where the player wants
+             * a .mpx of parts beside a .xpr. tools/mdl2costume rewrites one
+             * into the other by copying chunks, no geometry touched. Every
+             * character in this game rides the same 28-bone skeleton, so
+             * Miku's animations drive these as they drive her own. */
+            { "m000_kazu", "m000_kazu" },
+            { "m000_jyos", "m000_jyos" },
+            /* Kazuko's dress and hair wearing Miku's head: her face texture
+             * carried the head, eyes, teeth, neck and chest, so the draws
+             * that wear it are silenced and Miku's head part joins the pack,
+             * its texture indices moved past Kazuko's four. Built by
+             * tools/mdl2costume. */
+            { "m000_kazm", "m000_kazm" },
         };
         int ci = xbox_GfxConfig()->costume;
         int lantern = xbox_GfxConfig()->light_prop == 1;
@@ -5042,7 +5057,18 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
-    g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+    /* The event the title passed. NtReadFile/NtWriteFile signal it when the
+     * transfer completes, and a title that streams a file issues its reads
+     * with one event each and waits on them to know a buffer is ready. The
+     * bridge used to drop the handle here and pass NULL, so the kernel had
+     * nothing to signal: every such wait blocked forever. Fatal Frame only
+     * reads this way for its WMV cutscenes, which is why it took skipping
+     * one to show -- the title waits for its outstanding movie reads while
+     * holding a critical section, and the whole game stops with a white
+     * screen and a thread parked in RtlEnterCriticalSection. */
+    g_eax = (uint32_t)xbox_NtReadFile(handle,
+                STACK_ARG(1) ? bridge_resolve_handle(STACK_ARG(1)) : NULL,
+                NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
 
     /* What a read actually delivered. A decoder that rejects its input cannot
@@ -5137,7 +5163,9 @@ static void bridge_NtWriteFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
-    g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
+    g_eax = (uint32_t)xbox_NtWriteFile(handle,                /* event: see NtReadFile */
+                STACK_ARG(1) ? bridge_resolve_handle(STACK_ARG(1)) : NULL,
+                NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
