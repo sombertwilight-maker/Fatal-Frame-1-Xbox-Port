@@ -2588,7 +2588,15 @@ static int setup_pixels(const Nv2aGpuState *st)
          * the relight vertex path can land a hair nearer than the first
          * pass, and the stray depth then rejects the characters drawn after
          * it (the doll room hid Miku below the beam cone's footprint). The
-         * redraw's depth is redundant by construction: drop the write. */
+         * redraw's depth is redundant by construction: drop the write.
+         *
+         * Only where the redraw is additive (destination factor ONE). The
+         * title gates other things on a stencil EQUAL as well -- a mirror
+         * stencils its surface and then draws the reflected scene through
+         * it with ordinary alpha blending, and there the depth writes are
+         * what sorts the reflection internally. Dropping those put 190 of
+         * one frame's 374 draws through unsorted and wrecked the mirrors
+         * in Mafuyu's section. */
         {
             static int nozw = -1;
             if (nozw < 0) {
@@ -2596,7 +2604,8 @@ static int setup_pixels(const Nv2aGpuState *st)
                 nozw = !(e && *e == '0');
             }
             if (nozw && rs->stencil_enable && rs->stencil_func == 0x202
-                && rs->blend_enable && rs->depth_func == 0x203 && rs->depth_write)
+                && rs->blend_enable && rs->blend_dst == 1
+                && rs->depth_func == 0x203 && rs->depth_write)
                 dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
         }
         if (rs->stencil_enable) {
