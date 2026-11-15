@@ -31,6 +31,7 @@
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
 #include "recomp_icall_feedback.h"
+#include "video/gfx_config.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -4315,6 +4316,68 @@ static NTSTATUS bridge_create_file_open(
     }
 
     memset(&ios, 0, sizeof(ios));
+
+    /* Costume selection (F6 menu): Miku's model and texture packs live as
+     * m000_miku.* beside alternates (m000_miku2/4/5, m000_spe*). When an
+     * outfit is chosen, opens of m000_miku.* first try the alternate with
+     * the same extension; a missing piece (several outfits are texture-only
+     * or mesh-only) falls back to the default file, matching how the title
+     * mixes them. */
+    {
+        /* Mesh and texture pack are chosen separately: the five "special"
+         * packs are palette swaps sized exactly like m000_miku4.xpr, so
+         * they dress the miku4 mesh; the intro's lantern mesh (miku2) has
+         * no pack of its own and borrows miku4's. */
+        /* The US release ships eight outfits: the international default,
+         * the purple outfit (miku5), three street outfits on the miku4
+         * body (its own pack plus spe5/spe6), and three lantern-carrying
+         * yukatas on the miku2 body (spe1/spe2/spe3) -- the grouping the
+         * XBE's own filename table uses. */
+        static const struct { const char *mesh, *tex; } cost_base[] = {
+            { NULL, NULL },
+            { "m000_miku5", "m000_miku5" },
+            { "m000_miku4", "m000_miku4" },
+            { "m000_miku4", "m000_spe5" },
+            { "m000_miku4", "m000_spe6" },
+            { "m000_miku2", "m000_spe1" },
+            { "m000_miku2", "m000_spe2" },
+            { "m000_miku2", "m000_spe3" },
+        };
+        int ci = xbox_GfxConfig()->costume;
+        const char *tail = name.Buffer ? strrchr(name.Buffer, '\\') : NULL;
+        if (ci > 0 && ci < (int)(sizeof cost_base / sizeof cost_base[0])
+            && tail && _strnicmp(tail + 1, "m000_miku.", 10) == 0) {
+            static char alt[560];
+            XBOX_ANSI_STRING aname;
+            XBOX_OBJECT_ATTRIBUTES aoa;
+            size_t head = (size_t)(tail + 1 - name.Buffer);
+            const char *base = _stricmp(tail + 10, ".xpr") == 0
+                               ? cost_base[ci].tex : cost_base[ci].mesh;
+            if (head + strlen(base) + strlen(tail + 10) + 1 < sizeof alt) {
+                memcpy(alt, name.Buffer, head);
+                strcpy(alt + head, base);
+                strcat(alt, tail + 10);        /* ".ext" of the original */
+                aname.Buffer = alt;
+                aname.Length = (USHORT)strlen(alt);
+                aname.MaximumLength = (USHORT)(aname.Length + 1);
+                aoa = oa;
+                aoa.ObjectName = &aname;
+                st = xbox_NtCreateFile(&h, access, &aoa, &ios, NULL,
+                                       file_attrs, share, disposition, options);
+                if (NT_SUCCESS(st)) {
+                    static int said;
+                    if (said < 8) {
+                        said++;
+                        fprintf(stderr, "  [COSTUME] %s -> %s\n", tail + 1, alt + head);
+                    }
+                    bridge_write_handle(handle_va, h);
+                    bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
+                    return st;
+                }
+                memset(&ios, 0, sizeof(ios));
+            }
+        }
+    }
 
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
                            file_attrs, share, disposition, options);

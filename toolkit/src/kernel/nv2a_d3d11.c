@@ -3193,6 +3193,65 @@ static const char s_blit_src[] =
     "  p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); t = q * uv.xy; }\n"
     "float4 ps(float4 p : SV_Position, float2 t : TEXCOORD0) : SV_Target { return T.Sample(S, t); }\n";
 
+/* Post-processing: a soft-threshold bloom at half resolution plus a final
+ * colour grade (contrast, saturation, bloom add). Driven by the EFFECTS tab
+ * of the F6 menu (fx_bloom / fx_contrast / fx_saturation, all live). */
+static const char s_fx_src[] =
+    "cbuffer F : register(b0) { float4 a; float4 b; float4 e; float4 f; };\n"
+    "Texture2D T : register(t0); SamplerState S : register(s0);\n"
+    "Texture2D T1 : register(t1);\n"
+    "float4 ps_thresh(float4 p : SV_Position, float2 t : TEXCOORD0) : SV_Target {\n"
+    "  float3 c = T.Sample(S, t * a.xy).rgb;\n"
+    "  float l = dot(c, float3(0.299, 0.587, 0.114));\n"
+    "  float f = saturate((l - 0.55) / 0.45);\n"
+    "  return float4(c * f * f, 1); }\n"
+    "float4 ps_blur(float4 p : SV_Position, float2 t : TEXCOORD0) : SV_Target {\n"
+    "  float3 c = T.Sample(S, t).rgb * 0.227;\n"
+    "  c += (T.Sample(S, t + a.zw * 1.385).rgb + T.Sample(S, t - a.zw * 1.385).rgb) * 0.316;\n"
+    "  c += (T.Sample(S, t + a.zw * 3.231).rgb + T.Sample(S, t - a.zw * 3.231).rgb) * 0.070;\n"
+    "  return float4(c, 1); }\n"
+    "float4 ps_grade(float4 p : SV_Position, float2 t : TEXCOORD0) : SV_Target {\n"
+    "  float2 uv = t * a.xy;\n"
+    "  float3 c;\n"
+    "  if (f.z > 0) {\n"
+    "    float2 d = (t - 0.5) * f.z * 0.012 * a.xy;\n"
+    "    c.r = T.Sample(S, uv + d).r;\n"
+    "    c.g = T.Sample(S, uv).g;\n"
+    "    c.b = T.Sample(S, uv - d).b;\n"
+    "  } else c = T.Sample(S, uv).rgb;\n"
+    "  if (e.w > 0) {\n"
+    "    float3 n = T.Sample(S, uv + float2(a.z, 0)).rgb\n"
+    "             + T.Sample(S, uv - float2(a.z, 0)).rgb\n"
+    "             + T.Sample(S, uv + float2(0, a.w)).rgb\n"
+    "             + T.Sample(S, uv - float2(0, a.w)).rgb;\n"
+    "    c = saturate(c + (c - n * 0.25) * e.w);\n"
+    "  }\n"
+    "  c *= b.w;\n"
+    "  c = pow(saturate(c), 1.0 / max(e.x, 0.1));\n"
+    "  c = (c - 0.5) * b.y + 0.5;\n"
+    "  float l = dot(c, float3(0.299, 0.587, 0.114));\n"
+    "  c = lerp(l.xxx, c, b.z);\n"
+    "  c += float3(f.x, f.x * 0.2, -f.x) * 0.1;\n"
+    "  c += T1.Sample(S, t).rgb * b.x;\n"
+    "  if (e.y > 0) {\n"
+    "    float2 q = t - 0.5;\n"
+    "    c *= 1.0 - e.y * smoothstep(0.25, 0.75, dot(q, q) * 2.0);\n"
+    "  }\n"
+    "  if (e.z > 0) {\n"
+    "    float g = frac(sin(dot(p.xy + f.w, float2(12.9898, 78.233))) * 43758.5453);\n"
+    "    c += (g - 0.5) * e.z * 0.25;\n"
+    "  }\n"
+    "  if (f.y > 0)\n"
+    "    c *= 1.0 - f.y * 0.35 * (0.5 + 0.5 * sin(p.y * 3.14159));\n"
+    "  return float4(saturate(c), 1); }\n";
+
+static ID3D11PixelShader *s_fx_thresh, *s_fx_blur, *s_fx_grade;
+static ID3D11Buffer *s_fx_cb;
+static ID3D11Texture2D *s_fx_tex[2];
+static ID3D11RenderTargetView *s_fx_rtv[2];
+static ID3D11ShaderResourceView *s_fx_srv[2];
+static UINT s_fx_w, s_fx_h;
+
 static ID3D11VertexShader *s_blit_vs;
 static ID3D11PixelShader *s_blit_ps;
 static ID3D11Buffer *s_blit_cb;
@@ -3233,6 +3292,20 @@ static int blit_init(void)
     memset(&bd, 0, sizeof bd);
     bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.ByteWidth = 16;
     ID3D11Device_CreateBuffer(D, &bd, NULL, &s_blit_cb);
+    bd.ByteWidth = 64;
+    ID3D11Device_CreateBuffer(D, &bd, NULL, &s_fx_cb);
+    if ((b = compile(s_fx_src, "ps_thresh", "ps_4_0"))) {
+        ID3D11Device_CreatePixelShader(D, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &s_fx_thresh);
+        ID3D10Blob_Release(b);
+    }
+    if ((b = compile(s_fx_src, "ps_blur", "ps_4_0"))) {
+        ID3D11Device_CreatePixelShader(D, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &s_fx_blur);
+        ID3D10Blob_Release(b);
+    }
+    if ((b = compile(s_fx_src, "ps_grade", "ps_4_0"))) {
+        ID3D11Device_CreatePixelShader(D, ID3D10Blob_GetBufferPointer(b), ID3D10Blob_GetBufferSize(b), NULL, &s_fx_grade);
+        ID3D10Blob_Release(b);
+    }
     memset(&sd, 0, sizeof sd);
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -3284,6 +3357,68 @@ static void blit(ID3D11RenderTargetView *rtv, ID3D11ShaderResourceView *srv,
     ID3D11DeviceContext_Draw(C, 3, 0);
     ID3D11DeviceContext_PSSetShaderResources(C, 0, 1, &none);
     k_reset();                      /* everything above bypassed the shadow */
+}
+
+/* blit with a chosen pixel shader, FX constants, and an optional second
+ * texture; geometry and state otherwise as blit(). */
+static void fx_pass(ID3D11RenderTargetView *rtv, ID3D11ShaderResourceView *t0,
+                    ID3D11ShaderResourceView *t1, ID3D11PixelShader *ps,
+                    float x, float y, float w, float h, const float fx[16])
+{
+    D3D11_VIEWPORT vp = { x, y, w, h, 0, 1 };
+    D3D11_RECT sc = { (LONG)x, (LONG)y, (LONG)(x + w), (LONG)(y + h) };
+    float cb[4] = { 1, 1, 0, 0 };
+    ID3D11ShaderResourceView *none[2] = { NULL, NULL };
+    D3D11_DEPTH_STENCIL_DESC dd;
+
+    memset(&dd, 0, sizeof dd);
+    dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    ID3D11DeviceContext_OMSetRenderTargets(C, 1, &rtv, NULL);
+    ID3D11DeviceContext_RSSetViewports(C, 1, &vp);
+    ID3D11DeviceContext_RSSetScissorRects(C, 1, &sc);
+    ID3D11DeviceContext_RSSetState(C, s_rs); K.rs_ptr = s_rs;
+    ID3D11DeviceContext_OMSetBlendState(C, NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_OMSetDepthStencilState(C, get_dss(&dd), 0);
+    ID3D11DeviceContext_UpdateSubresource(C, (ID3D11Resource *)s_blit_cb, 0, NULL, cb, 0, 0);
+    ID3D11DeviceContext_UpdateSubresource(C, (ID3D11Resource *)s_fx_cb, 0, NULL, fx, 0, 0);
+    ID3D11DeviceContext_IASetInputLayout(C, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(C, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST); K.topo = 1;
+    ID3D11DeviceContext_VSSetShader(C, s_blit_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(C, 0, 1, &s_blit_cb);
+    ID3D11DeviceContext_PSSetShader(C, ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(C, 0, 1, &s_fx_cb);
+    ID3D11DeviceContext_PSSetShaderResources(C, 0, 1, &t0);
+    if (t1) ID3D11DeviceContext_PSSetShaderResources(C, 1, 1, &t1);
+    ID3D11DeviceContext_PSSetSamplers(C, 0, 1, &s_blit_lin);
+    ID3D11DeviceContext_Draw(C, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(C, 0, 2, none);
+    k_reset();
+}
+
+static int fx_targets(UINT w, UINT h)
+{
+    int i;
+    if (s_fx_w == w && s_fx_h == h && s_fx_srv[1])
+        return 1;
+    for (i = 0; i < 2; i++) {
+        if (s_fx_srv[i]) { ID3D11ShaderResourceView_Release(s_fx_srv[i]); s_fx_srv[i] = NULL; }
+        if (s_fx_rtv[i]) { ID3D11RenderTargetView_Release(s_fx_rtv[i]); s_fx_rtv[i] = NULL; }
+        if (s_fx_tex[i]) { ID3D11Texture2D_Release(s_fx_tex[i]); s_fx_tex[i] = NULL; }
+    }
+    for (i = 0; i < 2; i++) {
+        D3D11_TEXTURE2D_DESC td;
+        memset(&td, 0, sizeof td);
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(D, &td, NULL, &s_fx_tex[i])))
+            return 0;
+        ID3D11Device_CreateRenderTargetView(D, (ID3D11Resource *)s_fx_tex[i], NULL, &s_fx_rtv[i]);
+        ID3D11Device_CreateShaderResourceView(D, (ID3D11Resource *)s_fx_tex[i], NULL, &s_fx_srv[i]);
+    }
+    s_fx_w = w; s_fx_h = h;
+    return s_fx_srv[1] != NULL;
 }
 
 static void swap_release(void)
@@ -3415,9 +3550,54 @@ static int present_window(RtEnt *rt, uint32_t w, uint32_t h)
         else { dh = ch; dw = ch * aw / ah; }
     }
     ID3D11DeviceContext_ClearRenderTargetView(C, s_swap_rtv, black);
-    blit(s_swap_rtv, rt->srv, (float)(w * s_scale) / rt->pw, (float)(h * s_scale) / rt->ph,
-         (float)(int)((cw - dw) / 2), (float)(int)((ch - dh) / 2), (float)(int)dw, (float)(int)dh,
-         s_blit_lin, NULL);
+    {
+        XboxGfxConfig *g = xbox_GfxConfig();
+        float su = (float)(w * s_scale) / rt->pw, sv = (float)(h * s_scale) / rt->ph;
+        float bx = (float)(int)((cw - dw) / 2), by = (float)(int)((ch - dh) / 2);
+        static float fx_time;
+        int fx_on = (g->fx_bloom > 0 || g->fx_contrast != 100 || g->fx_saturation != 100
+                     || g->fx_brightness != 100 || g->fx_gamma != 100 || g->fx_vignette > 0
+                     || g->fx_grain > 0 || g->fx_sharpen > 0 || g->fx_temp != 0
+                     || g->fx_scanlines > 0 || g->fx_ca > 0)
+                    && s_fx_grade && s_fx_blur && s_fx_thresh;
+        float cg[16];
+        fx_time += 1.0f;
+        if (fx_time > 4096.0f) fx_time = 0;
+        cg[0] = su; cg[1] = sv;
+        cg[2] = su / (float)(rt->pw ? rt->pw : 1) * 2.0f;
+        cg[3] = sv / (float)(rt->ph ? rt->ph : 1) * 2.0f;
+        cg[4] = (float)g->fx_bloom / 100.0f;
+        cg[5] = (float)g->fx_contrast / 100.0f;
+        cg[6] = (float)g->fx_saturation / 100.0f;
+        cg[7] = (float)g->fx_brightness / 100.0f;
+        cg[8] = (float)g->fx_gamma / 100.0f;
+        cg[9] = (float)g->fx_vignette / 100.0f;
+        cg[10] = (float)g->fx_grain / 100.0f;
+        cg[11] = (float)g->fx_sharpen / 100.0f * 1.5f;
+        cg[12] = (float)g->fx_temp / 100.0f;
+        cg[13] = (float)g->fx_scanlines / 100.0f;
+        cg[14] = (float)g->fx_ca / 100.0f;
+        cg[15] = fx_time;
+        if (fx_on && g->fx_bloom > 0 && fx_targets((UINT)(dw / 2) < 8 ? 8 : (UINT)(dw / 2),
+                                                   (UINT)(dh / 2) < 8 ? 8 : (UINT)(dh / 2))) {
+            float fxw = (float)s_fx_w, fxh = (float)s_fx_h;
+            float c0[16] = { su, sv, 0, 0 };
+            float cH[16] = { 1, 1, 1.0f / fxw, 0 };
+            float cV[16] = { 1, 1, 0, 1.0f / fxh };
+            fx_pass(s_fx_rtv[0], rt->srv, NULL, s_fx_thresh, 0, 0, fxw, fxh, c0);
+            fx_pass(s_fx_rtv[1], s_fx_srv[0], NULL, s_fx_blur, 0, 0, fxw, fxh, cH);
+            fx_pass(s_fx_rtv[0], s_fx_srv[1], NULL, s_fx_blur, 0, 0, fxw, fxh, cV);
+            fx_pass(s_swap_rtv, rt->srv, s_fx_srv[0], s_fx_grade, bx, by,
+                    (float)(int)dw, (float)(int)dh, cg);
+        } else if (fx_on) {
+            cg[4] = 0;
+            fx_pass(s_swap_rtv, rt->srv, NULL, s_fx_grade, bx, by,
+                    (float)(int)dw, (float)(int)dh, cg);
+        } else {
+            blit(s_swap_rtv, rt->srv, su, sv, bx, by,
+                 (float)(int)dw, (float)(int)dh, s_blit_lin, NULL);
+        }
+    }
     overlay_update();
     if (s_ovl_srv)
         blit(s_swap_rtv, s_ovl_srv, 1.0f, 1.0f, 0, 0, (float)s_ovl_w, (float)s_ovl_h,

@@ -27,6 +27,18 @@ typedef struct {
     volatile int widescreen;         /* 16:9: wider 3D FOV, stretched present (RECOMP_WIDESCREEN) */
     volatile int window_w, window_h; /* saved client size (RECOMP_WINDOW_W/H) */
     volatile int fullscreen;         /* borderless fullscreen (RECOMP_FULLSCREEN) */
+    volatile int fx_bloom;           /* 0..100: bloom strength (RECOMP_FX_BLOOM) */
+    volatile int fx_brightness;      /* 50..150, 100 = neutral */
+    volatile int fx_gamma;           /* 50..150, 100 = neutral */
+    volatile int fx_vignette;        /* 0..100 */
+    volatile int fx_grain;           /* 0..100: animated film grain */
+    volatile int fx_sharpen;         /* 0..100 */
+    volatile int fx_temp;            /* -100..100: cool..warm */
+    volatile int fx_scanlines;       /* 0..100 */
+    volatile int fx_ca;              /* 0..100: chromatic aberration */
+    volatile int fx_contrast;        /* 50..200, 100 = neutral (RECOMP_FX_CONTRAST) */
+    volatile int fx_saturation;      /* 0..200, 100 = neutral (RECOMP_FX_SATURATION) */
+    volatile int costume;            /* 0 = default outfit (RECOMP_COSTUME) */
     volatile int afterimage;         /* frame-feedback crossfade: motion trails /
                                       * afterimage filter (RECOMP_AFTERIMAGE) */
     volatile int direct_move;        /* title option: left stick moves the character (SIMS_DIRECT_MOVE) */

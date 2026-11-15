@@ -126,6 +126,18 @@ XboxGfxConfig *xbox_GfxConfig(void)
         s_gfx.window_h = env_int("RECOMP_WINDOW_H", 0);
         s_gfx.fullscreen = env_int("RECOMP_FULLSCREEN", 0) != 0;
         s_gfx.afterimage = env_int("RECOMP_AFTERIMAGE", 1) != 0;
+        s_gfx.fx_bloom = env_int("RECOMP_FX_BLOOM", 0);
+        s_gfx.fx_brightness = env_int("RECOMP_FX_BRIGHTNESS", 100);
+        s_gfx.fx_gamma = env_int("RECOMP_FX_GAMMA", 100);
+        s_gfx.fx_vignette = env_int("RECOMP_FX_VIGNETTE", 0);
+        s_gfx.fx_grain = env_int("RECOMP_FX_GRAIN", 0);
+        s_gfx.fx_sharpen = env_int("RECOMP_FX_SHARPEN", 0);
+        s_gfx.fx_temp = env_int("RECOMP_FX_TEMP", 0);
+        s_gfx.fx_scanlines = env_int("RECOMP_FX_SCANLINES", 0);
+        s_gfx.fx_ca = env_int("RECOMP_FX_CA", 0);
+        s_gfx.fx_contrast = env_int("RECOMP_FX_CONTRAST", 100);
+        s_gfx.fx_saturation = env_int("RECOMP_FX_SATURATION", 100);
+        s_gfx.costume = env_int("RECOMP_COSTUME", 0);
     }
     return &s_gfx;
 }
@@ -143,9 +155,15 @@ void xbox_GfxConfigSave(void)
     static const char *keys[] = { "RECOMP_GPU_SCALE", "RECOMP_WIDESCREEN",
                                   "RECOMP_SHOW_FPS", "RECOMP_WINDOW_W",
                                   "RECOMP_WINDOW_H", "RECOMP_FULLSCREEN",
-                                  "RECOMP_AFTERIMAGE" };
-    char vals[7][16];
-    int seen[7] = { 0 };
+                                  "RECOMP_AFTERIMAGE", "RECOMP_FX_BLOOM",
+                                  "RECOMP_FX_CONTRAST", "RECOMP_FX_SATURATION",
+                                  "RECOMP_COSTUME", "RECOMP_FX_BRIGHTNESS",
+                                  "RECOMP_FX_GAMMA", "RECOMP_FX_VIGNETTE",
+                                  "RECOMP_FX_GRAIN", "RECOMP_FX_SHARPEN",
+                                  "RECOMP_FX_TEMP", "RECOMP_FX_SCANLINES",
+                                  "RECOMP_FX_CA" };
+    char vals[19][16];
+    int seen[19] = { 0 };
     int k;
 
     snprintf(vals[0], sizeof vals[0], "%d", s_gfx.scale);
@@ -155,6 +173,18 @@ void xbox_GfxConfigSave(void)
     snprintf(vals[4], sizeof vals[4], "%d", s_gfx.window_h);
     snprintf(vals[5], sizeof vals[5], "%d", s_gfx.fullscreen ? 1 : 0);
     snprintf(vals[6], sizeof vals[6], "%d", s_gfx.afterimage ? 1 : 0);
+    snprintf(vals[7], sizeof vals[7], "%d", s_gfx.fx_bloom);
+    snprintf(vals[8], sizeof vals[8], "%d", s_gfx.fx_contrast);
+    snprintf(vals[9], sizeof vals[9], "%d", s_gfx.fx_saturation);
+    snprintf(vals[10], sizeof vals[10], "%d", s_gfx.costume);
+    snprintf(vals[11], sizeof vals[11], "%d", s_gfx.fx_brightness);
+    snprintf(vals[12], sizeof vals[12], "%d", s_gfx.fx_gamma);
+    snprintf(vals[13], sizeof vals[13], "%d", s_gfx.fx_vignette);
+    snprintf(vals[14], sizeof vals[14], "%d", s_gfx.fx_grain);
+    snprintf(vals[15], sizeof vals[15], "%d", s_gfx.fx_sharpen);
+    snprintf(vals[16], sizeof vals[16], "%d", s_gfx.fx_temp);
+    snprintf(vals[17], sizeof vals[17], "%d", s_gfx.fx_scanlines);
+    snprintf(vals[18], sizeof vals[18], "%d", s_gfx.fx_ca);
 
     snprintf(path, sizeof path, "%s\\fatalframe.ini", g_ff_root);
     snprintf(tmp, sizeof tmp, "%s\\fatalframe.ini.new", g_ff_root);

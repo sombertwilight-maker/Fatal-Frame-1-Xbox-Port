@@ -398,9 +398,44 @@ static void overlay_publish(uint32_t *px, uint32_t w, uint32_t h)
     xbox_FramebufferWindowOverlayLock(0);
 }
 
+static int s_menu_tab;                /* 0 display, 1 effects, 2 costumes */
+
+static const char *s_costumes[] = {
+    "International default", "Purple outfit",
+    "Street outfit A", "Street outfit B", "Street outfit C",
+    "Yukata A", "Yukata B", "Yukata C",
+};
+#define N_COSTUMES ((int)(sizeof s_costumes / sizeof s_costumes[0]))
+
+static int menu_items_on(int tab)
+{
+    return tab == 0 ? 6 : tab == 1 ? 11 : N_COSTUMES;
+}
+
 static void menu_line(char *out, size_t cap, int item)
 {
     XboxGfxConfig *g = xbox_GfxConfig();
+    if (s_menu_tab == 1) {
+        switch (item) {
+        case 0: snprintf(out, cap, "Bloom                  %d%%", g->fx_bloom); break;
+        case 1: snprintf(out, cap, "Contrast               %d%%", g->fx_contrast); break;
+        case 2: snprintf(out, cap, "Saturation             %d%%", g->fx_saturation); break;
+        case 3: snprintf(out, cap, "Brightness             %d%%", g->fx_brightness); break;
+        case 4: snprintf(out, cap, "Gamma                  %d%%", g->fx_gamma); break;
+        case 5: snprintf(out, cap, "Vignette               %d%%", g->fx_vignette); break;
+        case 6: snprintf(out, cap, "Film grain             %d%%", g->fx_grain); break;
+        case 7: snprintf(out, cap, "Sharpen                %d%%", g->fx_sharpen); break;
+        case 8: snprintf(out, cap, "Color temperature      %+d", g->fx_temp); break;
+        case 9: snprintf(out, cap, "Scanlines              %d%%", g->fx_scanlines); break;
+        case 10: snprintf(out, cap, "Chromatic aberration   %d%%", g->fx_ca); break;
+        }
+        return;
+    }
+    if (s_menu_tab == 2) {
+        snprintf(out, cap, "%s %s", g->costume == item ? "*" : " ",
+                 item < N_COSTUMES ? s_costumes[item] : "");
+        return;
+    }
     switch (item) {
     case 0:
         snprintf(out, cap, "Internal resolution    %dx  (%dx%d)",
@@ -430,7 +465,8 @@ static void menu_line(char *out, size_t cap, int item)
 static void menu_render(void)
 {
     enum { PW = 460, ROWH = 26, PAD = 14, MX = 24, MY = 24 };
-    int ph = PAD * 2 + ROWH * (MENU_ITEMS + 2);
+    int nitems = menu_items_on(s_menu_tab);
+    int ph = PAD * 2 + ROWH * (nitems + 3);
     uint32_t iw = PW + MX, ih = (uint32_t)(ph + MY);
     BITMAPINFO bi;
     void *bits = NULL;
@@ -509,9 +545,19 @@ static void menu_render(void)
     font = CreateFontA(19, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                        CLEARTYPE_QUALITY, FIXED_PITCH, "Consolas");
     of = (HFONT)SelectObject(mdc, font);
+    {
+        static const char *tabs[] = { "DISPLAY", "EFFECTS", "COSTUMES" };
+        int tx = MX + PAD, t;
+        for (t = 0; t < 3; t++) {
+            char tt[24];
+            snprintf(tt, sizeof tt, t == s_menu_tab ? "[%s]" : " %s ", tabs[t]);
+            SetTextColor(mdc, t == s_menu_tab ? RGB(255, 235, 235) : RGB(140, 125, 140));
+            TextOutA(mdc, tx, MY + PAD, tt, (int)strlen(tt));
+            tx += (int)(strlen(tt) + 2) * 11;
+        }
+    }
     SetTextColor(mdc, RGB(200, 190, 200));
-    TextOutA(mdc, MX + PAD, MY + PAD, "DISPLAY SETTINGS", 16);
-    for (i = 0; i < MENU_ITEMS; i++) {
+    for (i = 0; i < nitems; i++) {
         char line[96], row[112];
         int y = MY + PAD + ROWH + 6 + i * ROWH;
         menu_line(line, sizeof line, i);
@@ -528,8 +574,13 @@ static void menu_render(void)
         TextOutA(mdc, MX + PAD, y, row, (int)strlen(row));
     }
     SetTextColor(mdc, RGB(140, 125, 140));
-    TextOutA(mdc, MX + PAD, MY + PAD + ROWH + 10 + MENU_ITEMS * ROWH,
-             "arrows change   F6/Esc close", 28);
+    {
+        const char *hint = s_menu_tab == 2
+            ? "Tab: page   outfit applies on next game launch"
+            : "arrows change   Tab: page   F6/Esc close";
+        TextOutA(mdc, MX + PAD, MY + PAD + ROWH + 10 + nitems * ROWH,
+                 hint, (int)strlen(hint));
+    }
     GdiFlush();
 
     out = (uint32_t *)malloc((size_t)iw * ih * 4);
@@ -560,6 +611,37 @@ static void fb_toggle_fullscreen(HWND h);
 static void menu_change(int item, int dir)
 {
     XboxGfxConfig *g = xbox_GfxConfig();
+    if (s_menu_tab == 1) {
+        static volatile int *const fld[11] = { 0 };  /* placeholder, set below */
+        struct { volatile int *v; int lo, hi, step; } e;
+        (void)fld;
+        switch (item) {
+        case 0:  e.v = &g->fx_bloom;      e.lo = 0;   e.hi = 100; e.step = 5; break;
+        case 1:  e.v = &g->fx_contrast;   e.lo = 50;  e.hi = 200; e.step = 5; break;
+        case 2:  e.v = &g->fx_saturation; e.lo = 0;   e.hi = 200; e.step = 5; break;
+        case 3:  e.v = &g->fx_brightness; e.lo = 50;  e.hi = 150; e.step = 5; break;
+        case 4:  e.v = &g->fx_gamma;      e.lo = 50;  e.hi = 150; e.step = 5; break;
+        case 5:  e.v = &g->fx_vignette;   e.lo = 0;   e.hi = 100; e.step = 5; break;
+        case 6:  e.v = &g->fx_grain;      e.lo = 0;   e.hi = 100; e.step = 5; break;
+        case 7:  e.v = &g->fx_sharpen;    e.lo = 0;   e.hi = 100; e.step = 5; break;
+        case 8:  e.v = &g->fx_temp;       e.lo = -100; e.hi = 100; e.step = 10; break;
+        case 9:  e.v = &g->fx_scanlines;  e.lo = 0;   e.hi = 100; e.step = 5; break;
+        case 10: e.v = &g->fx_ca;         e.lo = 0;   e.hi = 100; e.step = 5; break;
+        default: return;
+        }
+        *e.v += dir * e.step;
+        if (*e.v < e.lo) *e.v = e.lo;
+        if (*e.v > e.hi) *e.v = e.hi;
+        xbox_GfxConfigSave();
+        menu_render();
+        return;
+    }
+    if (s_menu_tab == 2) {
+        g->costume = item;
+        xbox_GfxConfigSave();
+        menu_render();
+        return;
+    }
     switch (item) {
     case 0:
         g->scale += dir;
@@ -595,8 +677,9 @@ static void menu_change(int item, int dir)
 static void menu_key(int vk)
 {
     switch (vk) {
-    case VK_UP:    s_menu_sel = (s_menu_sel + MENU_ITEMS - 1) % MENU_ITEMS; menu_render(); break;
-    case VK_DOWN:  s_menu_sel = (s_menu_sel + 1) % MENU_ITEMS; menu_render(); break;
+    case VK_TAB:   s_menu_tab = (s_menu_tab + 1) % 3; s_menu_sel = 0; menu_render(); break;
+    case VK_UP:    s_menu_sel = (s_menu_sel + menu_items_on(s_menu_tab) - 1) % menu_items_on(s_menu_tab); menu_render(); break;
+    case VK_DOWN:  s_menu_sel = (s_menu_sel + 1) % menu_items_on(s_menu_tab); menu_render(); break;
     case VK_LEFT:  menu_change(s_menu_sel, -1); break;
     case VK_RIGHT:
     case VK_RETURN: menu_change(s_menu_sel, 1); break;
