@@ -22,3 +22,4 @@ __pycache__/
 # game-derived analysis outputs (made from your disc by the tools)
 toolkit/tools/*/output/
 !toolkit/tools/conformance/test.xbe
+dist/

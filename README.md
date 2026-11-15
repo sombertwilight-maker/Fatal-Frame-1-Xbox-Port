@@ -25,6 +25,33 @@ Extras over the original:
   - window size presets and borderless fullscreen (F11 / Alt+Enter)
   - FPS counter
 
+## Players — quick start
+
+Download the latest release, unzip it anywhere, and **drag your own
+*Fatal Frame (USA)* disc image onto `PlayFatalFrame.bat`**.
+
+The first run translates the game from your disc and builds
+`fatalframe.exe` on your machine — a few minutes, once. After that the
+same file starts the game immediately. You can also drag the ISO straight
+onto `fatalframe.exe` once it exists, or just leave the ISO beside it.
+
+You need, one time only:
+
+- [Python 3.10+](https://www.python.org/downloads/) — tick *Add python.exe to PATH*
+- [CMake](https://cmake.org/download/) — tick *Add CMake to PATH*
+- [Visual Studio 2022 Community](https://visualstudio.microsoft.com/downloads/)
+  with the *Desktop development with C++* workload
+
+`PlayFatalFrame.bat` checks for these and tells you which is missing.
+
+**Why you build it instead of downloading an exe.** The executable contains
+the game's own code, lifted from the XBE — roughly 29 MB of translated C.
+Shipping that would mean distributing Tecmo's copyrighted program, so no
+release here will ever include it. The toolkit is ours to give away; the
+game is yours, and the translation happens on your computer, from your disc,
+and stays there. Every project of this kind works this way for the same
+reason.
+
 ## Building
 
 Requirements: Python 3.10+ with `capstone`, CMake, and either Visual Studio
