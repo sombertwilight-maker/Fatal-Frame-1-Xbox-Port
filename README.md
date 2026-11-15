@@ -35,14 +35,12 @@ The first run translates the game from your disc and builds
 same file starts the game immediately. You can also drag the ISO straight
 onto `fatalframe.exe` once it exists, or just leave the ISO beside it.
 
-You need, one time only:
-
-- [Python 3.10+](https://www.python.org/downloads/) — tick *Add python.exe to PATH*
-- [CMake](https://cmake.org/download/) — tick *Add CMake to PATH*
-- [Visual Studio 2022 Community](https://visualstudio.microsoft.com/downloads/)
-  with the *Desktop development with C++* workload
-
-`PlayFatalFrame.bat` checks for these and tells you which is missing.
+All you need is the disc image. The first run downloads the build tools
+(Python, CMake, a C compiler — about 200 MB) into a `tools/` folder beside
+the script, then translates and builds. Nothing is installed system-wide:
+it all lands in that folder, and deleting it removes every trace. If you
+already have Python, CMake and Visual Studio, it uses those and skips the
+download.
 
 **Why you build it instead of downloading an exe.** The executable contains
 the game's own code, lifted from the XBE — roughly 29 MB of translated C.

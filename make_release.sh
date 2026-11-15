@@ -10,6 +10,9 @@ rm -rf "dist/$OUT" && mkdir -p "dist/$OUT"
 cp -r project toolkit "dist/$OUT/"
 cp regen.bat regen.sh PlayFatalFrame.bat BUILDING.txt README.md \
    README_PLAYERS.txt LICENSE "dist/$OUT/" 2>/dev/null || true
+# only the fetch script, never a toolchain someone downloaded locally
+mkdir -p "dist/$OUT/tools"
+cp tools/bootstrap.ps1 "dist/$OUT/tools/"
 
 # strip anything generated, built, or belonging to the game
 rm -rf "dist/$OUT"/project/build* "dist/$OUT"/project/src/recomp/gen/*

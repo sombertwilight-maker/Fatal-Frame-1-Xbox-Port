@@ -15,18 +15,22 @@ You can also drop the ISO in this folder and just double-click
 PlayFatalFrame.bat -- it will find it.
 
 
-WHAT YOU NEED (one time)
-------------------------
-  Python 3.10+   https://www.python.org/downloads/
-                 tick "Add python.exe to PATH" in the installer
-  CMake          https://cmake.org/download/
-                 tick "Add CMake to PATH"
-  Visual Studio 2022 Community, with the
-  "Desktop development with C++" workload
-                 https://visualstudio.microsoft.com/downloads/
+WHAT YOU NEED
+-------------
+A copy of Fatal Frame (USA) for the Xbox, as a disc image. That is all.
 
-PlayFatalFrame.bat checks for each of these and tells you which one is
-missing, so you can just run it and see.
+The first run downloads the build tools it needs (Python, CMake and a C
+compiler, about 200 MB) into a tools\ folder beside this file, then
+translates and builds the game. That happens once; after it, starting the
+game is instant. You need an internet connection for that first run only.
+
+Nothing is installed on your system and nothing touches your registry --
+everything lands in this folder, and deleting it removes every trace.
+
+If the machine is offline, or a firewall blocks the downloads, you can
+instead install Python 3.10+, CMake and Visual Studio 2022 (with the
+"Desktop development with C++" workload) yourself; the script uses them
+if it finds them and skips the download.
 
 
 WHY THERE IS NO READY-MADE EXE

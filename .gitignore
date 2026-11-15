@@ -23,3 +23,9 @@ __pycache__/
 toolkit/tools/*/output/
 !toolkit/tools/conformance/test.xbe
 dist/
+
+# toolchain fetched by tools/bootstrap.ps1 on a player machine
+tools/python/
+tools/cmake/
+tools/mingw/
+tools/ninja/
