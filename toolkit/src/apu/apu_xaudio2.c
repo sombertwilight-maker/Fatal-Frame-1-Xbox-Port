@@ -25,11 +25,24 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-/* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
- * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
- * override them at xa2_init, clamped to the static storage below. */
-#define XA2_BUF_SAMPLES_DEFAULT 512
-#define XA2_NUM_BUFS_DEFAULT    4
+/* Device buffer size and count. RECOMP_AUDIO_BUF_SAMPLES and
+ * RECOMP_AUDIO_BUF_COUNT override them at xa2_init, clamped to the static
+ * storage below.
+ *
+ * 1024 x 8 is about 170 ms queued at worst. The old default of 512 x 4 was
+ * 43 ms, and that is too thin to survive a cutscene: while a movie plays
+ * the title refuses the points where queued interrupts may run, so the
+ * APU's interrupts build a backlog (one capture showed 200 posted against
+ * 191 run) and the voice is left without samples long enough to go quiet
+ * for the rest of the scene. The backlog itself is unchanged by this --
+ * the deeper queue simply rides it out, which costs latency and nothing
+ * else. Forcing those interrupts through instead was tried and never even
+ * engaged.
+ *
+ * Lower both if the extra latency is audible; 512 x 8 is about 85 ms and
+ * still twice the cushion that failed. */
+#define XA2_BUF_SAMPLES_DEFAULT 1024
+#define XA2_NUM_BUFS_DEFAULT    8
 #define XA2_BUF_SAMPLES_MIN     128
 #define XA2_BUF_SAMPLES_MAX     4096
 #define XA2_NUM_BUFS_MIN        2
