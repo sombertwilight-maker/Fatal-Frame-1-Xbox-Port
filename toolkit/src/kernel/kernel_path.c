@@ -579,11 +579,98 @@ static void xbox_remember_host_path(const wchar_t *p)
 
 
 
+/* A file the player dropped in, standing in for one on the disc.
+ *
+ * Some things a costume needs are simply not on every region's disc: the
+ * Japanese Miku textures are not on the USA one, so the redirect asked for
+ * a file that could not exist, failed quietly, and the game fell back to
+ * the default texture over the costume's mesh. Rather than making people
+ * rebuild an ISO to add a file, look beside the executable first.
+ *
+ * Matched on file name alone, so assets\m000_mikuj.xpr answers wherever on
+ * the disc the title looks for m000_mikuj.xpr. Saves never come through
+ * here -- only disc reads -- so a save can never be shadowed by one.
+ */
+static BOOL asset_override(const char *xbox_path, xbox_host_char *buf, DWORD cap)
+{
+    const char *base = strrchr(xbox_path, '\\');
+    WCHAR dir[MAX_PATH], cand[MAX_PATH], bw[MAX_PATH], home[MAX_PATH] = {0};
+    const char *env;
+
+    base = base ? base + 1 : xbox_path;
+    if (!*base)
+        return FALSE;
+
+    env = getenv("RECOMP_ASSETS");
+    if (env && *env) {
+        MultiByteToWideChar(CP_ACP, 0, env, -1, dir, MAX_PATH);
+    } else {
+        WCHAR *slash;
+        DWORD n = GetModuleFileNameW(NULL, dir, MAX_PATH);
+        if (!n || n >= MAX_PATH)
+            return FALSE;
+        slash = wcsrchr(dir, L'\\');
+        if (!slash)
+            return FALSE;
+        *slash = L'\0';
+        wcscpy_s(home, MAX_PATH, dir);
+        wcscat_s(dir, MAX_PATH, L"\\assets");
+    }
+
+    MultiByteToWideChar(CP_ACP, 0, base, -1, bw, MAX_PATH);
+    swprintf_s(cand, MAX_PATH, L"%s\\%s", dir, bw);
+
+    /* assets\ wins. Then the undub set, which is only consulted when the
+     * marker file is there -- the Japanese voice tracks are a third of a
+     * gigabyte, far too much to copy back and forth to switch languages,
+     * so the toggle creates and removes a marker instead of moving files. */
+    if (GetFileAttributesW(cand) == INVALID_FILE_ATTRIBUTES) {
+        static int undub = -1;          /* -1 unknown, 0 off, 1 on */
+        if (undub < 0 && home[0]) {
+            WCHAR mark[MAX_PATH];
+            swprintf_s(mark, MAX_PATH, L"%s\\undub.on", home);
+            undub = GetFileAttributesW(mark) != INVALID_FILE_ATTRIBUTES;
+            /* Say so once. Whether the undub is on was otherwise invisible:
+             * the only evidence was the language coming out of the speakers,
+             * which is no help when the question is why it has not changed. */
+            fprintf(stderr, "  [UNDUB] %s (%S)\n",
+                    undub ? "on" : "off", mark);
+            fflush(stderr);
+        }
+        if (undub != 1 || !home[0])
+            return FALSE;
+        swprintf_s(cand, MAX_PATH, L"%s\\undub\\%s", home, bw);
+        if (GetFileAttributesW(cand) == INVALID_FILE_ATTRIBUTES)
+            return FALSE;
+    }
+
+    wcsncpy_s(buf, cap, cand, _TRUNCATE);
+
+    /* The title sizes its buffers from a manifest baked into default.xbe,
+     * so a stand-in of a different length is read at the disc file's length
+     * -- truncated if longer, trailing rubbish if shorter. Correct the
+     * entry to this file's real size. Safe to set exactly here, unlike the
+     * costume redirect: one entry, one file, same name. */
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(cand, GetFileExInfoStandard, &fad)
+            && fad.nFileSizeHigh == 0) {
+            extern void ff_asset_toc_exact(const char *name, uint32_t size);
+            ff_asset_toc_exact(base, (uint32_t)fad.nFileSizeLow);
+        }
+    }
+
+    fprintf(stderr, "  [ASSET] %s -> %S\n", base, cand);
+    fflush(stderr);
+    return TRUE;
+}
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
     const char*  remainder = NULL;
     const WCHAR* base_dir  = NULL;
     const char*  sub_dir   = NULL;
+    int          is_save   = 0;
     int          skip;
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
@@ -611,6 +698,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
             base_dir  = s_rules[i].to_save == 2 ? USER_RULE_DIR(&s_rules[i])
                       : s_rules[i].to_save     ? s_save_dir : s_game_dir;
             sub_dir   = s_rules[i].sub_win;
+            is_save   = s_rules[i].to_save != 0;
             goto translate;
         }
     }
@@ -667,6 +755,10 @@ translate:
                              || host_path_buf[n - 1] == L'/'))
                 host_path_buf[--n] = L'\0';
         }
+
+        /* A player-supplied file wins over the disc, for disc reads only. */
+        if (!is_save)
+            asset_override(xbox_path, host_path_buf, buf_size);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %S", xbox_path, host_path_buf);
         xbox_remember_host_path(host_path_buf);

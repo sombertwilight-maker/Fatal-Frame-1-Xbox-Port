@@ -4296,16 +4296,195 @@ static int bridge_is_cdrom_device(const char *path)
  * sizes those buffers, grow the m000_miku.* entries to the redirect
  * target's real size. The table is static data in the guest image: find
  * the name string, then the record that points at it. */
+/* Where the player's model file landed in guest memory.
+ *
+ * On the Xbox the GPU reads vertices straight out of the loaded file -- the
+ * SGD carries a ready-made vertex buffer and the title points the NV2A at
+ * it in place. So a draw belongs to the player model exactly when its
+ * position stream sits inside the bytes we read for that file, and that is
+ * a far steadier test than guessing from draw sizes or bone counts, which
+ * change with every costume.
+ *
+ * Recorded here because this is the only place that knows which handle the
+ * file got; the renderer only ever sees an address. */
+uint32_t g_ff_model_lo, g_ff_model_hi;
+static void *s_model_handle;
+
+/* The player's model file, read here so the renderer has something to
+ * compare against: the title copies geometry into GPU memory, so the only
+ * steady way to recognise a draw as the player's is by its bytes. Only the
+ * first model of the pack matters -- that is the body the costume is. */
+void ff_model_note_handle(void *h)
+{
+    s_model_handle = h;
+}
+
+void ff_model_reference_from(const char *xbox_path)
+{
+    extern void ff_model_set_reference(const void *vb, uint32_t len);
+    xbox_host_char host[MAX_PATH];
+    FILE *f;
+    uint8_t *buf;
+    long size;
+    uint32_t off, vb, vbsz;
+
+    if (!xbox_translate_path(xbox_path, host, MAX_PATH))
+        return;
+#ifdef _WIN32
+    f = _wfopen(host, L"rb");
+#else
+    f = fopen(host, "rb");
+#endif
+    if (!f)
+        return;
+    fseek(f, 0, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    buf = size > 0x40 ? (uint8_t *)malloc((size_t)size) : NULL;
+    if (!buf || fread(buf, 1, (size_t)size, f) != (size_t)size) {
+        free(buf);
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    /* The .mpx is a pack of several models -- ten for the player -- and the
+     * title concatenates their vertex buffers into one region of GPU memory,
+     * in pack order. Treating only the first as hers leaves the rest drawn
+     * by the title: the body and the eyes. So gather every entry's vertices
+     * into one reference, and take the bone array from the first, which is
+     * the one the title poses; the others share that skeleton. */
+    {
+        uint8_t *all = (uint8_t *)malloc((size_t)size);
+        uint32_t used = 0, hdr = 0x10, n = 0;
+
+        while (all && hdr + 0x20 <= (uint32_t)size && n < 32) {
+            uint32_t esz = *(uint32_t *)(buf + hdr);
+            uint32_t pay = hdr + 0x10;
+
+            if (!esz || pay + esz > (uint32_t)size)
+                break;
+            if (*(uint32_t *)(buf + pay) == 0x1060) {    /* an SGD */
+                vb   = *(uint32_t *)(buf + pay + 0x10);
+                vbsz = *(uint32_t *)(buf + pay + 0x14);
+                if (n == 0) {
+                    extern void ff_model_set_header(const void *bones,
+                                                    uint32_t nbones);
+                    uint32_t coordp = *(uint32_t *)(buf + pay + 0x18);
+                    uint32_t matp   = *(uint32_t *)(buf + pay + 0x1c);
+                    if (matp > coordp) {
+                        extern void ff_model_set_bind(const void *bones,
+                                                      uint32_t n);
+                        uint32_t nb = (matp - coordp) / 0xE0u;
+                        ff_model_set_header(buf + pay + coordp, nb);
+                        ff_model_set_bind(buf + pay + coordp, nb);
+                    }
+                }
+                if (vbsz && vb + vbsz <= esz) {
+                    memcpy(all + used, buf + pay + vb, vbsz);
+                    used += vbsz;
+                }
+            }
+            hdr = pay + esz;
+            n++;
+        }
+        if (used)
+            ff_model_set_reference(all, used);
+        free(all);
+    }
+    free(buf);
+}
+
+void ff_model_note_read(void *h, uint32_t va, uint32_t len)
+{
+    if (!h || h != s_model_handle || !va || !len)
+        return;
+    if (!g_ff_model_lo || va < g_ff_model_lo)
+        g_ff_model_lo = va;
+    if (va + len > g_ff_model_hi)
+        g_ff_model_hi = va + len;
+}
+
+/* Rewrite the size the title has baked in for one asset.
+ *
+ * default.xbe carries a manifest of 12-byte records -- a pointer to the
+ * file's name, its size, its kind -- and the title sizes its buffers from
+ * the size field. Hand it a file of a different length and it still reads
+ * the length recorded here, so a replacement that is larger gets truncated
+ * and one that is smaller leaves the tail of the buffer full of whatever
+ * was there before.
+ *
+ * grow_only matters, and the distinction is not cosmetic:
+ *
+ *   - The costume redirect points ONE entry (m000_miku.xpr) at any of nine
+ *     different files. Shrinking it to fit the costume that happens to be
+ *     selected leaves the entry too small for the others, so that path may
+ *     only ever grow. Doing otherwise broke every costume built on a file
+ *     smaller than the default.
+ *
+ *   - An asset override is one entry, one file, matched by the same name.
+ *     Nothing else reads through it, so the exact size is both safe and
+ *     necessary -- it is the only way a Japanese voice clip of a different
+ *     length plays correctly.
+ */
+static void toc_set_size(const char *entry_name, uint32_t nsz, int grow_only)
+{
+    const uint8_t *g = (const uint8_t *)(uintptr_t)g_xbox_mem_offset;
+    const uint32_t lo = 0x10000, hi = 0x300000;
+    size_t nlen = strlen(entry_name) + 1;   /* match the NUL too */
+    uint32_t sva, va;
+
+    if (!g_xbox_mem_offset || !nsz)
+        return;
+
+    for (sva = lo; sva + nlen <= hi; sva++) {
+        if (memcmp(g + sva, entry_name, nlen) != 0)
+            continue;
+        for (va = lo & ~3u; va + 8 <= hi; va += 4) {
+            uint32_t old;
+            if (*(const uint32_t *)(g + va) != sva)
+                continue;
+            old = *(const uint32_t *)(g + va + 4);
+            if (old == 0 || old > (16u << 20))
+                continue;              /* not a size field */
+            if (grow_only ? (nsz > old) : (nsz != old)) {
+                *(uint32_t *)((uintptr_t)(va + 4) + g_xbox_mem_offset) = nsz;
+                fprintf(stderr, "  [TOC] %s: %u -> %u\n", entry_name, old, nsz);
+                fflush(stderr);
+            }
+            return;                    /* first matching record decides */
+        }
+    }
+}
+
+/* Called from the path resolver when a file in assets\ stands in for one on
+ * the disc. Exact, per the reasoning above, and once per name: the scan is
+ * linear over two and a half megabytes of guest memory, and a title opens
+ * the same sound many times. */
+void ff_asset_toc_exact(const char *name, uint32_t size)
+{
+    static char seen[64][64];
+    static int  nseen;
+    int i;
+
+    if (!name || !*name || !size)
+        return;
+    for (i = 0; i < nseen; i++)
+        if (_stricmp(seen[i], name) == 0)
+            return;
+    if (nseen < (int)(sizeof seen / sizeof seen[0])) {
+        strncpy(seen[nseen], name, sizeof seen[0] - 1);
+        seen[nseen][sizeof seen[0] - 1] = '\0';
+        nseen++;
+    }
+    toc_set_size(name, size, 0);
+}
+
 static void costume_toc_grow(const char *entry_name, const char *base,
                              const char *ext)
 {
     char xpath[160];
     xbox_host_char host[MAX_PATH];
     uint32_t nsz;
-    const uint8_t *g = (const uint8_t *)(uintptr_t)g_xbox_mem_offset;
-    const uint32_t lo = 0x10000, hi = 0x300000;
-    size_t nlen = strlen(entry_name) + 1;   /* match the NUL too */
-    uint32_t sva, va;
 
     snprintf(xpath, sizeof xpath,
              "\\Device\\CdRom0\\Media\\3ddata\\man\\mdl\\%s%s", base, ext);
@@ -4326,25 +4505,8 @@ static void costume_toc_grow(const char *entry_name, const char *base,
         nsz = (uint32_t)st.st_size;
     }
 #endif
-    for (sva = lo; sva + nlen <= hi; sva++) {
-        if (memcmp(g + sva, entry_name, nlen) != 0)
-            continue;
-        /* a record pointing at this copy of the name */
-        for (va = lo & ~3u; va + 8 <= hi; va += 4) {
-            uint32_t old;
-            if (*(const uint32_t *)(g + va) != sva)
-                continue;
-            old = *(const uint32_t *)(g + va + 4);
-            if (old == 0 || old > (16u << 20))
-                continue;              /* not a size field */
-            if (nsz != old) {
-                *(uint32_t *)((uintptr_t)(va + 4) + g_xbox_mem_offset) = nsz;
-                fprintf(stderr, "  [COSTUME] toc %s: %u -> %u (%s%s)\n",
-                        entry_name, old, nsz, base, ext);
-            }
-            return;                    /* first matching record decides */
-        }
-    }
+    /* grow only -- this entry is shared by every costume. */
+    toc_set_size(entry_name, nsz, 1);
 }
 
 
@@ -4395,33 +4557,64 @@ static NTSTATUS bridge_create_file_open(
          * body (its own pack plus spe5/spe6), and three lantern-carrying
          * yukatas on the miku2 body (spe1/spe2/spe3) -- the grouping the
          * XBE's own filename table uses. */
+        /* Row N here is row N of s_costumes[] in fb_present.c. The two are
+         * one table split across two files: reorder one and the other has
+         * to move with it, or the menu names a costume and loads another.
+         *
+         * m000_mikuj is the Japanese release's own Miku, mesh and texture
+         * both. It is not on the USA disc, so it loads from the assets\
+         * folder beside the executable -- see asset_override in
+         * kernel_path.c. Without those files this row falls back to the
+         * disc's default Miku, which is what "Jp Miku looks broken" was.
+         *
+         * m000_miku4 is the yukata body and m000_miku2 is the outfit body.
+         * The names used to say the opposite, which is how "Street outfit
+         * A" came to put Miku in a red yukata. */
         static const struct { const char *mesh, *tex; } cost_base[] = {
-            { NULL, NULL },
-            { "m000_miku5", "m000_miku5" },
-            { "m000_miku4", "m000_miku4" },
-            { "m000_miku4", "m000_spe5" },
-            { "m000_miku4", "m000_spe6" },
-            { "m000_miku2", "m000_spe1" },
-            { "m000_miku2", "m000_spe2" },
-            { "m000_miku2", "m000_spe3" },
-            { "m000_miku2", "m000_mikujp" },  /* retextured toward the JP default */
-            /* Outfits lifted from the NPC models. Kazuko (m007) and the
-             * assistant (m004) ship as .mdl -- one pack holding a texture
-             * set and a nested pack of mesh parts -- where the player wants
-             * a .mpx of parts beside a .xpr. tools/mdl2costume rewrites one
-             * into the other by copying chunks, no geometry touched. Every
-             * character in this game rides the same 28-bone skeleton, so
-             * Miku's animations drive these as they drive her own. */
-            { "m000_kazu", "m000_kazu" },
-            { "m000_jyos", "m000_jyos" },
-            /* Kazuko's dress and hair wearing Miku's head: her face texture
-             * carried the head, eyes, teeth, neck and chest, so the draws
-             * that wear it are silenced and Miku's head part joins the pack,
-             * its texture indices moved past Kazuko's four. Built by
-             * tools/mdl2costume. */
-            { "m000_kazm", "m000_kazm" },
+            { NULL, NULL },                                     /* Default        */
+            { "m000_mikuj",  "m000_mikuj"  },                   /* Jp Miku        */
+            { "m000_miku2", "m000_spe1" },                      /* Gyaru Miku     */
+            { "m000_miku2", "m000_spe2" },                      /* Goth Miku      */
+            { "m000_miku2", "m000_spe3" },                      /* Adventure Miku */
+            { "m000_miku5", "m000_miku5" },                     /* Purple Miku    */
+            { "m000_miku4", "m000_miku4" },                     /* Yukata Red     */
+            { "m000_miku4", "m000_spe5" },                      /* Yukata Blue    */
+            { "m000_miku4", "m000_spe6" },                      /* Yukata White   */
+            /* The yukatas wearing Jp Miku's head.
+             *
+             * No Japanese models are involved: this mesh is already on the
+             * USA disc. Only the head sheets differ -- her face, iris,
+             * lashes, brow and hair copied into the yukata texture packs,
+             * which is how Jp Miku herself was made (a retexture of Gyaru
+             * Miku; her pack and that one share a layout slot for slot).
+             *
+             * Only the yukatas. Gyaru and Purple are designed around their
+             * own faces, so swapping a head into them replaces the look
+             * rather than adding one.
+             *
+             * The "h" packs are built from the player's own two discs;
+             * without them these rows fall back to the default.
+             */
+            { "m000_miku4", "m000_miku4h" },                    /* Jp Yukata Red  */
+            { "m000_miku4", "m000_spe5h"  },                    /* Jp Yukata Blue */
+            { "m000_miku4", "m000_spe6h"  },                    /* Jp Yukata White*/
         };
         int ci = xbox_GfxConfig()->costume;
+        /* The costume is stored as an index, so shortening the list above
+         * silently repoints or invalidates whatever was saved. Out of range
+         * then falls through to the disc's default with nothing said, which
+         * reads as "the costume is broken" rather than "pick it again". */
+        {
+            static int warned;
+            int ncost = (int)(sizeof cost_base / sizeof cost_base[0]);
+            if (!warned && ci >= ncost) {
+                warned = 1;
+                fprintf(stderr, "  [COSTUME] saved index %d is past the end "
+                        "of the list (%d entries) -- using the default. "
+                        "Choose again in F6.\n", ci, ncost);
+                fflush(stderr);
+            }
+        }
         int lantern = xbox_GfxConfig()->light_prop == 1;
         const char *tail = name.Buffer ? strrchr(name.Buffer, '\\') : NULL;
         if (tail && _strnicmp(tail + 1, "m000_miku.", 10) == 0
@@ -4476,6 +4669,8 @@ static NTSTATUS bridge_create_file_open(
                         said++;
                         fprintf(stderr, "  [COSTUME] %s -> %s\n", tail + 1, alt + head);
                     }
+                    if (_stricmp(tail + 10, ".mpx") == 0)
+                        ff_model_reference_from(alt);
                     bridge_write_handle(handle_va, h);
                     bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
                     return st;
@@ -4488,6 +4683,14 @@ no_redirect:
 
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
                            file_attrs, share, disposition, options);
+    /* The player's model with no costume chosen comes through here, where
+     * the redirect block's `tail` has gone out of scope. */
+    if (NT_SUCCESS(st) && name.Buffer) {
+        const char *t = strrchr(name.Buffer, '\\');
+        if (t && _strnicmp(t + 1, "m000_miku", 9) == 0
+            && _stricmp(t + 10, ".mpx") == 0)
+            ff_model_reference_from(name.Buffer);
+    }
 
     if (NT_SUCCESS(st)) {
         bridge_write_handle(handle_va, h);
@@ -5070,6 +5273,8 @@ static void bridge_NtReadFile(void)
                 STACK_ARG(1) ? bridge_resolve_handle(STACK_ARG(1)) : NULL,
                 NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+
+    ff_model_note_read(handle, buffer_va, (uint32_t)ios.Information);
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
