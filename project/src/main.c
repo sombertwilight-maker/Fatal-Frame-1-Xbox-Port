@@ -498,6 +498,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     return 0;
 }
 
+
 /* ── XBE Loading ───────────────────────────────────────────── */
 
 static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)

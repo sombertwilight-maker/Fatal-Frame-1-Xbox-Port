@@ -189,6 +189,9 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_SURFACE_COLOR_OFFSET    0x0210
 #define NV097_SET_COLOR_CLEAR_VALUE       0x1D90
 #define NV097_CLEAR_SURFACE               0x1D94
+extern void ff_model_draw_note(int mine, uint32_t vertex_addr,
+                               uint32_t tex_addr, uint32_t count);
+
 #define NV097_SET_VERTEX_DATA_ARRAY_OFFSET 0x1720   /* +i*4, 16 attributes */
 #define NV097_SET_VERTEX_DATA_ARRAY_FORMAT 0x1760   /* +i*4 */
 #define NV097_SET_BEGIN_END               0x17FC
@@ -2278,6 +2281,17 @@ static void backend_flush(int textured)
         tex.filter = s_gpu.texs[0].filter;
         batch.texture = &tex;
     }
+    /* Which draws are the player's?
+     *
+     * This is the path the D3D11 backend actually takes; the other flush
+     * belongs to the software rasteriser and sees a handful of draws a
+     * second. Both the vertex array address and the texture address are
+     * recorded, because either could be the steady key: the title points
+     * the GPU at the vertex buffer inside the loaded model file, and the
+     * player's textures come from one .xpr. Draw sizes and bone counts are
+     * no good -- they change with every costume. */
+    ff_model_draw_note(0, s_gpu.attr[0].offset,
+                       batch.texture ? batch.texture->offset : 0, s_bcount);
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += s_bcount / 3;
     s_bcount = 0;
@@ -3978,6 +3992,173 @@ static int gpu_vsh_batch(uint32_t n)
         nv2a_drop_note(2, "gpu path: no usable colour surface, draw dropped", st.color_va, st.pitch);
         return 1;
     }
+    /* Which draws are the player's?
+     *
+     * Characters go through vertex programs, so this is their path. Here --
+     * unlike inside the back end -- the guest address the vertices were
+     * gathered from is still known, and the title points the GPU straight
+     * at the vertex buffer inside the loaded model file. Record the address,
+     * the texture it samples and the program's hash; between them one is
+     * the steady key for "this is the model we replace". */
+    {
+        extern int ff_model_is_player(uint32_t addr, const void *host_verts);
+        extern uint32_t ff_model_vb_base(void);
+        extern int ff_model_suppress(void);
+        int mine = ff_model_is_player(s_gpu.attr[0].offset, s_gin);
+        ff_model_draw_note(mine, s_gpu.attr[0].offset,
+                           s_gpu.texs[0].valid ? s_gpu.texs[0].offset : 0, nu);
+
+        /* One-shot anatomy dump of the player's draws: what the title feeds
+         * the vertex program, and what its constant file holds. The matrix
+         * palette is in there; this is how we find which slots it uses. */
+        if (mine) {
+            static int budget = -1;
+            if (budget < 0) {
+                const char *e = getenv("RECOMP_TMDL_DUMP");
+                budget = (e && e[0] && strcmp(e, "0") != 0) ? atoi(e) : 0;
+                if (budget < 0)
+                    budget = 0;
+            }
+            if (budget > 0) {
+                const float *m = s_gvsh.consts[96];
+                uint32_t amask = 0, ai;
+                for (ai = 0; ai < NV_VERTEX_ATTRS && ai < 32; ai++)
+                    if (s_gpu.attr[ai].size)
+                        amask |= 1u << ai;
+                budget--;
+                fprintf(stderr, "[DUMP] vb=%08X rel=%u nu=%u nidx=%u tex=%08X"
+                        " %ux%u a=%04X s=%u | %.4f %.4f %.4f %.4f"
+                        " | %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f\n",
+                        s_gpu.attr[0].offset,
+                        s_gpu.attr[0].offset - ff_model_vb_base(), nu, nidx,
+                        s_gpu.texs[0].valid ? s_gpu.texs[0].offset : 0,
+                        s_gpu.texs[0].valid ? s_gpu.texs[0].width : 0,
+                        s_gpu.texs[0].valid ? s_gpu.texs[0].height : 0,
+                        amask, s_gpu.attr[0].stride,
+                        m[0], m[1], m[2], m[3],
+                        m[4], m[5], m[6], m[7],
+                        m[8], m[9], m[10], m[11]);
+            }
+            {
+                extern void ff_model_note_matrix(uint32_t rel, const float *m);
+                ff_model_note_matrix(s_gpu.attr[0].offset - ff_model_vb_base(),
+                                     s_gvsh.consts[96]);
+            }
+        }
+        /* With the replacement model showing, the title's own player is
+         * not drawn: our geometry stands in its place. We stand in on one
+         * of her draws, because at that moment the surface, the depth
+         * state, the lighting constants and the vertex program are all set
+         * up for drawing a character -- and we hand the program vertices
+         * in the space it expects rather than overriding its matrix, since
+         * those same constants light the model as well as place it. */
+        if (mine && ff_model_suppress()) {
+            extern int      ff_model_pose(const float *c96);
+            extern uint32_t ff_model_mesh_count(void);
+            extern int      ff_model_mesh(uint32_t i, const float **verts,
+                                          uint32_t *nv, const uint32_t **idx,
+                                          uint32_t *ni, uint32_t *tex);
+            extern int      ff_model_texture(uint32_t i, uint32_t *va,
+                                             uint32_t *w, uint32_t *h);
+            extern int      ff_model_is_anchor(uint32_t rel, uint32_t nu);
+            extern void     ff_model_verify_palette(const float *c96);
+            extern void     ff_model_note_live_matrix(const float *c96);
+            extern int      ff_model_first_vertex(float out[16][4]);
+
+            if (ff_model_is_anchor(s_gpu.attr[0].offset - ff_model_vb_base(),
+                                   nu)) {
+                ff_model_note_live_matrix(s_gvsh.consts[96]);
+                if (ff_model_pose(s_gvsh.consts[96])) {
+                    uint32_t i, n = ff_model_mesh_count();
+                    uint32_t ok = 0, refused = 0;
+                    static uint32_t rounds;
+                    static int told;
+                    Nv2aGpuState os = st;
+
+                    ff_model_verify_palette(s_gvsh.consts[96]);
+
+                    /* Where hers lands, and where ours does, under the
+                     * title's own program run here on the CPU. If ours is
+                     * nowhere near the view the program is not using the
+                     * matrix the way we assumed. */
+                    if (!told && nu) {
+                        Nv2aVshOutput ha, hb;
+                        float ours[16][4];
+                        told = 1;
+                        if (nv2a_vsh_run((const float (*)[4])s_gin, &ha))
+                            fprintf(stderr, "[CLIP] hers %.2f %.2f %.2f w %.2f"
+                                    " -> %.3f %.3f\n", ha.pos[0], ha.pos[1],
+                                    ha.pos[2], ha.pos[3],
+                                    ha.pos[3] ? ha.pos[0] / ha.pos[3] : 0,
+                                    ha.pos[3] ? ha.pos[1] / ha.pos[3] : 0);
+                        if (ff_model_first_vertex(ours)
+                            && nv2a_vsh_run((const float (*)[4])ours, &hb))
+                            fprintf(stderr, "[CLIP] ours %.2f %.2f %.2f w %.2f"
+                                    " -> %.3f %.3f\n", hb.pos[0], hb.pos[1],
+                                    hb.pos[2], hb.pos[3],
+                                    hb.pos[3] ? hb.pos[0] / hb.pos[3] : 0,
+                                    hb.pos[3] ? hb.pos[1] / hb.pos[3] : 0);
+                    }
+
+                    /* Opaque, cutout alpha, no stencil, no culling. Depth
+                     * stays as the title set it: with the test doing its
+                     * work the nearest surface wins whatever our winding,
+                     * and turning it off let insides paint over the front. */
+                    os.rs.blend_enable = 0;
+                    os.rs.stencil_enable = 0;
+                    /* Keep the alpha test. The hair and the lashes are
+                     * cutout cards -- one of her textures is a seventh
+                     * clear -- and without it every transparent texel
+                     * draws as opaque, which turns them into the flat
+                     * planes that made the model look like a heap. */
+                    os.rs.alpha_test_enable = 1;
+                    os.rs.alpha_func = 0x0204;          /* GL_GREATER */
+                    os.rs.alpha_ref = 100;
+                    os.rs.cull_enable = 0;
+                    os.rs.color_mask = 0x01010101u;
+
+                    for (i = 0; i < n; i++) {
+                        const float *vp;
+                        const uint32_t *ip;
+                        uint32_t nv2, ni2, tx, tva, tw, th;
+
+                        if (!ff_model_mesh(i, &vp, &nv2, &ip, &ni2, &tx))
+                            continue;
+                        if (ff_model_texture(tx, &tva, &tw, &th)) {
+                            memset(os.tex, 0, sizeof os.tex);
+                            os.tex[0].offset = tva;
+                            os.tex[0].width = tw;
+                            os.tex[0].height = th;
+                            os.tex[0].pitch = tw * 4;
+                            os.tex[0].color = 0x12;      /* LIN_A8R8G8B8 */
+                            os.tex[0].levels = 1;
+                            os.tex[0].filter = 2u << 24;
+                            os.tex[0].addr_u = 1;
+                            os.tex[0].addr_v = 1;
+                            os.tex[0].normalized = 1;
+                            os.tex[0].bytes = tw * th * 4;
+                            os.tex[0].valid = 1;
+                            os.use_rc = 0;
+                            os.textured = 1;
+                        }
+                        if (s_gpub->draw_vsh(&os, &s_gvsh, vp, nv2,
+                                             (uint32_t *)ip, ni2))
+                            ok++;
+                        else
+                            refused++;
+                    }
+                    if (rounds++ % 120 == 0)
+                        fprintf(stderr, "[DRAW] our model: %u drawn,"
+                                " %u refused, surf %08X\n",
+                                ok, refused, st.color_va);
+                }
+            }
+            s_gpu.batches_program++;
+            note_drawn();
+            return 1;
+        }
+    }
+
     {
         uint64_t t0 = xbox_HostNowNs();
         int r = s_gpub->draw_vsh(&st, &s_gvsh, (const float *)s_gin, nu, s_gidx, nidx);

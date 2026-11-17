@@ -308,8 +308,10 @@ static char *gen_ps(const PsKey *k)
                      * filtering is the NV2A's own percentage-closer filter. */
                     static int force = -2;
                     if (force == -2) {
+                        /* on by default: without it the flashlight gives
+                         * no light on most machines */
                         const char *e = getenv("RECOMP_SHADOW_FORCE");
-                        force = e && *e ? atoi(e) : -1;
+                        force = e && *e ? atoi(e) : 1;
                     }
                     if (force >= 0)
                         bput(&b, "  t%d = %d;\n", st, force);
@@ -353,7 +355,7 @@ static char *gen_ps(const PsKey *k)
                             static double rbias = -1.0;
                             if (rbias < 0) {
                                 const char *e2 = getenv("RECOMP_SHADOW_RBIAS");
-                                rbias = e2 && *e2 ? atof(e2) : 1000.0;
+                                rbias = e2 && *e2 ? atof(e2) : 2500.0;
                                 if (rbias < 0) rbias = 0;
                             }
                         bput(&b, "  { float q = %s.w != 0 ? %s.w : 1; float zm = 1.0 / TS[%d].z;\n"
@@ -553,7 +555,7 @@ static char *gen_ps(const PsKey *k)
         static int noat = -1;
         if (noat < 0) {
             const char *e = getenv("RECOMP_BEAM_NOAT");
-            noat = e && *e == '1';
+            noat = e && *e ? *e == '1' : 1;   /* on by default */
         }
         if (noat && k->kind[2] == 3) {
             /* Diagnostic: the beam pass survives without its alpha test. */
@@ -1634,8 +1636,6 @@ static int bind_surface(const Nv2aGpuState *st, int want_depth, const uint32_t r
     s_vcb_data[0] = 2.0f / (float)rt->w;
     s_vcb_data[1] = 2.0f / (float)rt->h;
     s_vcb_data[2] = 1.0f / (st->zeta_bits == 16 ? 65535.0f : 16777215.0f);
-    /* the widescreen factor survives the wipe: every path reads it */
-    s_vcb_data[6] = xbox_GfxConfig()->widescreen ? 0.75f : 0.0f;
     k_vcb(s_vcb_data);
     s_cur_rt = rt;
     if (ds_out) *ds_out = ds;
@@ -2669,31 +2669,13 @@ static int setup_pixels(const Nv2aGpuState *st)
             K.rs_ptr = want;
         }
     }
-    {
-        /* Widescreen: a draw that samples a render target is the game
-         * re-drawing its own frame (the miasma veil, heat haze). The frame
-         * already spans the full target, so this draw keeps the identity
-         * mapping; squeezed, the copy lands offset against the live scene
-         * -- a double image.
-         *
-         * A draw into a sub-screen offscreen target (the flashlight's
-         * 256x256 shadow map, and any other small intermediate buffer) must
-         * also keep the identity mapping. The squeeze is a screen-aspect
-         * correction; applied to a light-space shadow map it shifts the map's
-         * x against the light-matrix texture coordinates the beam samples it
-         * with -- which our x-only squeeze never touches -- so the cone
-         * collapses to a thin line and the glow dies. The screen targets are
-         * 640 wide; anything narrower is not the screen. */
-        int offscreen_small = s_cur_rt && s_cur_rt->w < 512;
-        float ws = (!s_draw_samples_rt && !offscreen_small
-                    && xbox_GfxConfig()->widescreen) ? 0.75f : 0.0f;
-        if (s_draw_samples_rt)
-            s_glow_fb++;
-        if (s_vcb_data[6] != ws) {
-            s_vcb_data[6] = ws;
-            k_vcb(s_vcb_data);
-        }
-    }
+    /* s_vcb_data[6] is the vertex shaders' x-squeeze. It stays 0 (the
+     * shaders' identity: "vx.z != 0 ? vx.z : 1.0"). The 16:9 Hor+ option
+     * that drove it is gone -- the window stretches the native 4:3 frame
+     * instead, which leaves every projection and screen-space placement
+     * exactly where the title put it. */
+    if (s_draw_samples_rt)
+        s_glow_fb++;
     return 1;
 }
 
@@ -3093,6 +3075,7 @@ static int d3d_draw_vsh(const Nv2aGpuState *st, const Nv2aGpuVsh *vs,
     }
     if (!setup_pixels(st))
         return 1;                     /* nothing the CPU could do better */
+
     if (nverts && flash_on() && vs->stride >= 16) {
         flash_note(st, in, vs->stride, in + 12, nverts);
         wrec_note(st, in, vs->stride, in + 12, nverts);
@@ -3692,10 +3675,11 @@ static int present_window(RtEnt *rt, uint32_t w, uint32_t h)
     }
     cw = (float)s_swap_w; ch = (float)s_swap_h;
     {
-        /* content aspect: the frame's own, or 16:9 with widescreen on */
+        /* The frame fills the client area when "stretch to window" is on
+         * (the default), else it is letterboxed to its own 4:3 shape. */
         float aw = (float)w, ah = (float)h;
-        if (xbox_GfxConfig()->widescreen) { aw = 16.0f; ah = 9.0f; }
-        if (cw * ah <= ch * aw) { dw = cw; dh = cw * ah / aw; }
+        if (xbox_GfxConfig()->stretch) { dw = cw; dh = ch; }
+        else if (cw * ah <= ch * aw) { dw = cw; dh = cw * ah / aw; }
         else { dh = ch; dw = ch * aw / ah; }
     }
     ID3D11DeviceContext_ClearRenderTargetView(C, s_swap_rtv, black);
@@ -4242,11 +4226,6 @@ static void apply_gfx_settings(void)
             s_glow_blitfail = s_glow_plain = 0;
         }
     }
-    /* Widescreen: perspective draws squeeze x by 3/4 in the render target
-     * and the window stretches 4:3 to 16:9 -- net: the same proportions
-     * with a third more world at the sides (Hor+). Screen-space draws
-     * (w == 1: UI, text) keep their place. */
-    s_vcb_data[6] = g->widescreen ? 0.75f : 0.0f;
     if (reload_seen != g->reload_seq) {
         reload_seen = g->reload_seq;
         tex_cache_clear();

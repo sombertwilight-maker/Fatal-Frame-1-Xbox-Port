@@ -29,9 +29,26 @@ add_compile_definitions(
 # Option B: find_package (if you install xboxrecomp system-wide)
 #   find_package(xboxrecomp REQUIRED)
 #
-# Adjust this path to point to your xboxrecomp clone:
-set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH
-    "Path to the xboxrecomp toolkit root directory")
+# The toolkit is "xboxrecomp" in a plain clone and "toolkit" inside a
+# packaged release, so look for both rather than making one layout the only
+# one that builds. Override with -DXBOXRECOMP_DIR=... for anything else.
+if(NOT XBOXRECOMP_DIR)
+  foreach(_cand "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../toolkit")
+    if(EXISTS "${_cand}/CMakeLists.txt")
+      set(XBOXRECOMP_DIR "${_cand}")
+      break()
+    endif()
+  endforeach()
+endif()
+if(NOT XBOXRECOMP_DIR OR NOT EXISTS "${XBOXRECOMP_DIR}/CMakeLists.txt")
+  message(FATAL_ERROR
+    "Cannot find the xboxrecomp toolkit. Expected it beside this project as "
+    "../xboxrecomp or ../toolkit; pass -DXBOXRECOMP_DIR=<path> if it is "
+    "somewhere else.")
+endif()
+set(XBOXRECOMP_DIR "${XBOXRECOMP_DIR}" CACHE PATH
+    "Path to the xboxrecomp toolkit root directory" FORCE)
 
 # Add xboxrecomp as a subdirectory -- this builds all 6 runtime libraries
 # and provides the 'xboxrecomp' umbrella target to link against.

@@ -24,7 +24,10 @@ typedef struct {
     volatile int tex_replace;
     volatile int reload_seq;         /* bumped: re-read textures\replace */
     volatile int fps60;              /* experimental: 120 Hz vblank (RECOMP_FPS60) */
-    volatile int widescreen;         /* 16:9: wider 3D FOV, stretched present (RECOMP_WIDESCREEN) */
+    volatile int stretch;            /* fill the window, ignoring aspect: no bars,
+                                      * on by default (RECOMP_STRETCH). Shown in
+                                      * the menu as "Widescreen" -- the frame is
+                                      * still native 4:3, scaled out to fit. */
     volatile int window_w, window_h; /* saved client size (RECOMP_WINDOW_W/H) */
     volatile int fullscreen;         /* borderless fullscreen (RECOMP_FULLSCREEN) */
     volatile int fx_bloom;           /* 0..100: bloom strength (RECOMP_FX_BLOOM) */

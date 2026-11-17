@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gpu_present.h"
+#include "gfx_config.h"
 
 static ID3D11Device             *s_dev;
 static ID3D11DeviceContext      *s_ctx;
@@ -194,11 +195,17 @@ int gpu_present_frame(const uint32_t *pixels)
                                           pixels, s_w * 4, 0);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_rtv, black);
-    /* The largest rectangle of the frame's shape that fits, centred. */
+    /* The largest rectangle of the frame's shape that fits, centred --
+     * or the whole client area when "stretch to window" is on. */
     sx = (float)s_bw / (float)s_w;
     sy = (float)s_bh / (float)s_h;
-    vp.Width = (float)s_w * (sx < sy ? sx : sy);
-    vp.Height = (float)s_h * (sx < sy ? sx : sy);
+    if (xbox_GfxConfig()->stretch) {
+        vp.Width = (float)s_bw;
+        vp.Height = (float)s_bh;
+    } else {
+        vp.Width = (float)s_w * (sx < sy ? sx : sy);
+        vp.Height = (float)s_h * (sx < sy ? sx : sy);
+    }
     vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
     vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;
     vp.MinDepth = 0; vp.MaxDepth = 1;

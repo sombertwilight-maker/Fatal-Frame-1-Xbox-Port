@@ -34,6 +34,18 @@ static volatile uint32_t *guest32(uint32_t va)
 }
 
 extern uint32_t nv2a_pb_exec_flips(void);
+extern void ff_anim_poll(void);          /* RECOMP_ANIMSCAN value scan */
+extern int  ff_anim_status(char *, int);
+extern void fb_set_status_cb(int (*)(char *, int));
+extern void        ff_cheats_init(const char *dir);
+extern void        ff_cheats_apply(void);
+extern void        ff_cheats_list(char *, int);
+extern int         ff_cheat_count(void);
+extern const char *ff_cheat_name(int);
+extern int         ff_cheat_on(int);
+extern void        ff_cheat_toggle(int);
+extern void fb_set_cheat_hooks(int (*)(void), const char *(*)(int),
+                               int (*)(int), void (*)(int));
 extern void xbox_KernelThreadDump(void);
 
 /* No flip for a while (a hang -- or a movie, which plays on the overlay
@@ -70,6 +82,9 @@ static DWORD WINAPI glue_thread(LPVOID arg)
             tick = GetTickCount();
             hang_watch();
         }
+        ff_anim_poll();
+        ff_cheats_apply();
+        { extern void ff_model_frame_end(void); ff_model_frame_end(); }
         uint32_t dev = *guest32(FF_D3D_DEVICE_PTR_VA);
         if (dev && dev < 0x04000000u) {
             uint32_t sem = *guest32(dev + FF_DEV_SEMAPHORE_PTR);
@@ -90,6 +105,15 @@ void ff_gpu_glue_start(void)
     const char *pb = getenv("RECOMP_PB_EXEC");
     if (!pb || !*pb || *pb == '0')
         return;
+    fb_set_status_cb(ff_anim_status);
+    {
+        extern char g_ff_root[];
+        extern int ff_tmdl_boot(void);
+        ff_cheats_init(g_ff_root);
+        ff_tmdl_boot();
+        fb_set_cheat_hooks(ff_cheat_count, ff_cheat_name,
+                           ff_cheat_on, ff_cheat_toggle);
+    }
     HANDLE h = CreateThread(NULL, 0, glue_thread, NULL, 0, NULL);
     if (h) CloseHandle(h);
 }
@@ -120,25 +144,25 @@ XboxGfxConfig *xbox_GfxConfig(void)
         s_gfx.scale = env_int("RECOMP_GPU_SCALE", 1);
         if (s_gfx.scale < 1) s_gfx.scale = 1;
         if (s_gfx.scale > 4) s_gfx.scale = 4;
-        s_gfx.widescreen = env_int("RECOMP_WIDESCREEN", 0) != 0;
+        s_gfx.stretch = env_int("RECOMP_STRETCH", 1) != 0;
         s_gfx.show_fps = env_int("RECOMP_SHOW_FPS", 0) != 0;
         s_gfx.window_w = env_int("RECOMP_WINDOW_W", 0);
         s_gfx.window_h = env_int("RECOMP_WINDOW_H", 0);
         s_gfx.fullscreen = env_int("RECOMP_FULLSCREEN", 0) != 0;
-        s_gfx.afterimage = env_int("RECOMP_AFTERIMAGE", 1) != 0;
-        s_gfx.fx_bloom = env_int("RECOMP_FX_BLOOM", 0);
+        s_gfx.afterimage = env_int("RECOMP_AFTERIMAGE", 0) != 0;
+        s_gfx.fx_bloom = env_int("RECOMP_FX_BLOOM", 40);
         s_gfx.fx_brightness = env_int("RECOMP_FX_BRIGHTNESS", 100);
         s_gfx.fx_gamma = env_int("RECOMP_FX_GAMMA", 100);
         s_gfx.fx_vignette = env_int("RECOMP_FX_VIGNETTE", 0);
         s_gfx.fx_grain = env_int("RECOMP_FX_GRAIN", 0);
-        s_gfx.fx_sharpen = env_int("RECOMP_FX_SHARPEN", 0);
-        s_gfx.fx_temp = env_int("RECOMP_FX_TEMP", 0);
+        s_gfx.fx_sharpen = env_int("RECOMP_FX_SHARPEN", 95);
+        s_gfx.fx_temp = env_int("RECOMP_FX_TEMP", 10);
         s_gfx.fx_scanlines = env_int("RECOMP_FX_SCANLINES", 0);
         s_gfx.fx_ca = env_int("RECOMP_FX_CA", 0);
-        s_gfx.fx_contrast = env_int("RECOMP_FX_CONTRAST", 100);
-        s_gfx.fx_saturation = env_int("RECOMP_FX_SATURATION", 100);
+        s_gfx.fx_contrast = env_int("RECOMP_FX_CONTRAST", 105);
+        s_gfx.fx_saturation = env_int("RECOMP_FX_SATURATION", 125);
         s_gfx.costume = env_int("RECOMP_COSTUME", 0);
-        s_gfx.light_prop = env_int("RECOMP_LIGHT_PROP", 0);
+        s_gfx.light_prop = env_int("RECOMP_LIGHT_PROP", 1);
         s_gfx.tex_dump = env_int("RECOMP_TEX_DUMP", 0);
     }
     return &s_gfx;
@@ -154,7 +178,7 @@ void xbox_GfxConfigSave(void)
     char *text = NULL;
     size_t len = 0;
     FILE *f;
-    static const char *keys[] = { "RECOMP_GPU_SCALE", "RECOMP_WIDESCREEN",
+    static const char *keys[] = { "RECOMP_GPU_SCALE", "RECOMP_STRETCH",
                                   "RECOMP_SHOW_FPS", "RECOMP_WINDOW_W",
                                   "RECOMP_WINDOW_H", "RECOMP_FULLSCREEN",
                                   "RECOMP_AFTERIMAGE", "RECOMP_FX_BLOOM",
@@ -163,13 +187,14 @@ void xbox_GfxConfigSave(void)
                                   "RECOMP_FX_GAMMA", "RECOMP_FX_VIGNETTE",
                                   "RECOMP_FX_GRAIN", "RECOMP_FX_SHARPEN",
                                   "RECOMP_FX_TEMP", "RECOMP_FX_SCANLINES",
-                                  "RECOMP_FX_CA", "RECOMP_LIGHT_PROP" };
-    char vals[20][16];
-    int seen[20] = { 0 };
+                                  "RECOMP_FX_CA", "RECOMP_LIGHT_PROP",
+                                  "RECOMP_CHEATS_ON" };
+    char vals[21][96];
+    int seen[21] = { 0 };
     int k;
 
     snprintf(vals[0], sizeof vals[0], "%d", s_gfx.scale);
-    snprintf(vals[1], sizeof vals[1], "%d", s_gfx.widescreen ? 1 : 0);
+    snprintf(vals[1], sizeof vals[1], "%d", s_gfx.stretch ? 1 : 0);
     snprintf(vals[2], sizeof vals[2], "%d", s_gfx.show_fps ? 1 : 0);
     snprintf(vals[3], sizeof vals[3], "%d", s_gfx.window_w);
     snprintf(vals[4], sizeof vals[4], "%d", s_gfx.window_h);
@@ -188,6 +213,7 @@ void xbox_GfxConfigSave(void)
     snprintf(vals[17], sizeof vals[17], "%d", s_gfx.fx_scanlines);
     snprintf(vals[18], sizeof vals[18], "%d", s_gfx.fx_ca);
     snprintf(vals[19], sizeof vals[19], "%d", s_gfx.light_prop);
+    ff_cheats_list(vals[20], (int)sizeof vals[20]);
 
     snprintf(path, sizeof path, "%s\\fatalframe.ini", g_ff_root);
     snprintf(tmp, sizeof tmp, "%s\\fatalframe.ini.new", g_ff_root);
