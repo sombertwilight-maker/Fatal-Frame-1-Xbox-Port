@@ -71,7 +71,7 @@ void xbox_InputInit(void)
     }
 }
 
-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+static DWORD pad_get_state_impl(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
     DWORD result;
@@ -290,7 +290,7 @@ void xbox_InputInit(void)
     SDL_UnlockJoysticks();
 }
 
-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+static DWORD pad_get_state_impl(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
@@ -409,3 +409,33 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 }
 
 #endif /* _WIN32 */
+
+/* ---- menu capture -------------------------------------------------------
+ *
+ * While the overlay menu is up its presses belong to the menu, not to the
+ * game: without this, choosing a costume with A also fires A at Miku. The
+ * menu reads through xbox_InputGetStateRaw and so still sees the pad; every
+ * other caller is the game, and gets a neutral pad until the menu closes.
+ */
+static int s_menu_capture;
+
+void xbox_InputMenuCapture(int on)
+{
+    s_menu_capture = on ? 1 : 0;
+}
+
+DWORD xbox_InputGetStateRaw(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    return pad_get_state_impl(dwPort, pState);
+}
+
+DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    DWORD r = pad_get_state_impl(dwPort, pState);
+    if (r == ERROR_SUCCESS && pState && s_menu_capture) {
+        DWORD packet = pState->dwPacketNumber;
+        memset(&pState->Gamepad, 0, sizeof pState->Gamepad);
+        pState->dwPacketNumber = packet;
+    }
+    return r;
+}

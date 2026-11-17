@@ -38,6 +38,7 @@
  * is the thing that receives the keys, so that is what has to remember
  * them. */
 #include "keyboard.h"   /* src/input */
+#include "xinput_xbox.h" /* src/input -- pad for the menu */
 #include "gpu_present.h"
 #include "recomp_exit_hook.h"   /* src/platform */
 #include <stdbool.h>
@@ -358,23 +359,24 @@ void xbox_FramebufferWindowOverlayLock(int lock)
         ReleaseSRWLockExclusive(&s_ovl_img_lock);
 }
 
-/* Window-size presets per aspect; the same row is the same tier. */
-static const struct { int w43, h43, w169, h169; } s_win_presets[] = {
-    {  640,  480,  854,  480 },
-    {  960,  720, 1280,  720 },
-    { 1280,  960, 1600,  900 },
-    { 1600, 1200, 1920, 1080 },
-    { 1920, 1440, 2560, 1440 },
+/* Window-size presets. The frame is 4:3 and "stretch to window" fills
+ * whatever shape the window is, so these are only a starting size. */
+static const struct { int w, h; } s_win_presets[] = {
+    {  640,  480 },
+    {  960,  720 },
+    { 1280,  960 },
+    { 1600, 1200 },
+    { 1920, 1440 },
 };
 #define N_WIN_PRESETS (int)(sizeof s_win_presets / sizeof s_win_presets[0])
 static int s_win_preset = 1;
 
-static void menu_window_size(int preset, int widescreen)
+static void menu_window_size(int preset)
 {
     RECT r;
     XboxGfxConfig *g = xbox_GfxConfig();
-    int cw = widescreen ? s_win_presets[preset].w169 : s_win_presets[preset].w43;
-    int ch = widescreen ? s_win_presets[preset].h169 : s_win_presets[preset].h43;
+    int cw = s_win_presets[preset].w;
+    int ch = s_win_presets[preset].h;
     g->window_w = cw;
     g->window_h = ch;
     if (s_fullscreen || !s_hwnd_pub)
@@ -387,6 +389,29 @@ static void menu_window_size(int preset, int widescreen)
 
 /* Draw `text` rows into a fresh BGRA image (straight alpha) and publish it
  * to the back end. The rows draw with the stock system font into a DIB. */
+/* An optional extra line for the corner readout: the game sets this, and
+ * whatever it writes is shown under the FPS. Used by the value scanner so a
+ * key press is visibly doing something. */
+static int (*s_status_cb)(char *, int);
+void fb_set_status_cb(int (*cb)(char *, int)) { s_status_cb = cb; }
+
+/* The CHEATS tab is driven by the game, which owns the cheat file; the
+ * toolkit only draws the rows and forwards a toggle. */
+typedef struct {
+    int (*count)(void);
+    const char *(*name)(int);
+    int (*is_on)(int);
+    void (*toggle)(int);
+} FbCheatHooks;
+static FbCheatHooks s_ch;
+void fb_set_cheat_hooks(int (*count)(void), const char *(*name)(int),
+                        int (*is_on)(int), void (*toggle)(int))
+{
+    s_ch.count = count; s_ch.name = name;
+    s_ch.is_on = is_on; s_ch.toggle = toggle;
+}
+static int cheat_rows(void) { return s_ch.count ? s_ch.count() : 0; }
+
 static void overlay_publish(uint32_t *px, uint32_t w, uint32_t h)
 {
     xbox_FramebufferWindowOverlayLock(1);
@@ -400,21 +425,52 @@ static void overlay_publish(uint32_t *px, uint32_t w, uint32_t h)
 
 static int s_menu_tab;                /* 0 display, 1 effects, 2 costumes */
 
+/* Order and names are the player's. Each row here lines up with the row at
+ * the same index in cost_base[] in kernel_bridge.c -- the label and the
+ * files it maps to are two halves of one table, so they move together or
+ * not at all. The old names had the two body meshes the wrong way round:
+ * m000_miku4 is the yukata, m000_miku2 is the outfit set. */
 static const char *s_costumes[] = {
-    "International default", "Purple outfit",
-    "Street outfit A", "Street outfit B", "Street outfit C",
-    "Yukata A", "Yukata B", "Yukata C", "Japanese Miku",
+    "Default",
+    "Jp Miku",
+    "Gyaru Miku",
+    "Goth Miku",
+    "Adventure Miku",
+    "Purple Miku",
+    "Yukata Red",
+    "Yukata Blue",
+    "Yukata White",
+    "Jp Yukata Red",
+    "Jp Yukata Blue",
+    "Jp Yukata White",
 };
 #define N_COSTUMES ((int)(sizeof s_costumes / sizeof s_costumes[0]))
 
+static void game_restart(void);   /* defined below, used by menu_change */
+
 static int menu_items_on(int tab)
 {
-    return tab == 0 ? 6 : tab == 1 ? 11 : N_COSTUMES + 1;
+    if (tab == 3) {
+        int n = cheat_rows();
+        return n ? n : 1;          /* one row to say the file is missing */
+    }
+    /* costumes: the light prop, every outfit, then Restart on the end --
+     * the costume only takes hold when the model is next loaded, so the
+     * thing that applies it belongs on the same page. */
+    return tab == 0 ? 6 : tab == 1 ? 11 : N_COSTUMES + 2;
 }
 
 static void menu_line(char *out, size_t cap, int item)
 {
     XboxGfxConfig *g = xbox_GfxConfig();
+    if (s_menu_tab == 3) {
+        if (!cheat_rows())
+            snprintf(out, cap, "no cheats yet - add them to fatalframe_cheats.ini");
+        else
+            snprintf(out, cap, "%-28.28s %s", s_ch.name(item),
+                     s_ch.is_on(item) ? "On" : "Off");
+        return;
+    }
     if (s_menu_tab == 1) {
         switch (item) {
         case 0: snprintf(out, cap, "Bloom                  %d%%", g->fx_bloom); break;
@@ -435,9 +491,26 @@ static void menu_line(char *out, size_t cap, int item)
         if (item == 0)
             snprintf(out, cap, "Light prop             %s",
                      g->light_prop ? "Lantern" : "Flashlight");
-        else
-            snprintf(out, cap, "%s %s", g->costume == item - 1 ? "*" : " ",
-                     item - 1 < N_COSTUMES ? s_costumes[item - 1] : "");
+        else if (item == N_COSTUMES + 1)
+            snprintf(out, cap, "Restart game   (unsaved progress is lost)");
+        else {
+            /* The model is read when the game loads it, not when this is
+             * chosen, so picking a costume mid-session changes nothing on
+             * screen until the next launch. Saying so here: without it the
+             * menu claims one costume while another is plainly standing in
+             * front of you, which reads as the costume being broken.
+             *
+             * The boot value is captured the first time this menu is drawn
+             * -- the earliest moment a change could be made, so it is still
+             * whatever the game actually loaded with. */
+            static int boot = -1;
+            if (boot < 0)
+                boot = g->costume;
+            snprintf(out, cap, "%s %s%s", g->costume == item - 1 ? "*" : " ",
+                     item - 1 < N_COSTUMES ? s_costumes[item - 1] : "",
+                     (g->costume == item - 1 && g->costume != boot)
+                         ? "   (restart to apply)" : "");
+        }
         return;
     }
     switch (item) {
@@ -446,12 +519,11 @@ static void menu_line(char *out, size_t cap, int item)
                  g->scale, 640 * g->scale, 480 * g->scale);
         break;
     case 1:
-        snprintf(out, cap, "Widescreen (16:9)      %s", g->widescreen ? "On" : "Off");
+        snprintf(out, cap, "Widescreen             %s", g->stretch ? "On" : "Off");
         break;
     case 2:
         snprintf(out, cap, "Window size            %dx%d",
-                 g->widescreen ? s_win_presets[s_win_preset].w169 : s_win_presets[s_win_preset].w43,
-                 g->widescreen ? s_win_presets[s_win_preset].h169 : s_win_presets[s_win_preset].h43);
+                 s_win_presets[s_win_preset].w, s_win_presets[s_win_preset].h);
         break;
     case 3:
         snprintf(out, cap, "Fullscreen             %s", s_fullscreen ? "On" : "Off");
@@ -468,9 +540,9 @@ static void menu_line(char *out, size_t cap, int item)
 
 static void menu_render(void)
 {
-    enum { PW = 460, ROWH = 26, PAD = 14, MX = 24, MY = 24 };
+    enum { PW = 560, ROWH = 26, PAD = 14, MX = 24, MY = 24 };
     int nitems = menu_items_on(s_menu_tab);
-    int ph = PAD * 2 + ROWH * (nitems + 3);
+    int ph = PAD * 2 + ROWH * (nitems + 4);   /* +1 for the pad legend */
     uint32_t iw = PW + MX, ih = (uint32_t)(ph + MY);
     BITMAPINFO bi;
     void *bits = NULL;
@@ -480,14 +552,18 @@ static void menu_render(void)
     uint32_t *out;
     int i;
 
-    if (!s_menu_open && !xbox_GfxConfig()->show_fps) {
+    char st[64];
+    int have_st = s_status_cb ? s_status_cb(st, (int)sizeof st) : 0;
+
+    if (!s_menu_open && !xbox_GfxConfig()->show_fps && !have_st) {
         overlay_publish(NULL, 0, 0);
         return;
     }
     if (!s_menu_open) {
-        /* FPS alone: a small line at the top-left corner. */
+        /* The corner readout: FPS, and the scanner's line under it. */
         char t[32];
-        iw = 148; ih = 30;
+        int show_fps = xbox_GfxConfig()->show_fps;
+        iw = 210; ih = have_st ? (show_fps ? 50 : 30) : 30;
         memset(&bi, 0, sizeof bi);
         bi.bmiHeader.biSize = sizeof bi.bmiHeader;
         bi.bmiHeader.biWidth = (LONG)iw;
@@ -504,9 +580,15 @@ static void menu_render(void)
         font = CreateFontA(18, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                            CLEARTYPE_QUALITY, 0, "Segoe UI");
         of = (HFONT)SelectObject(mdc, font);
-        snprintf(t, sizeof t, "FPS %.1f", s_fps_shown);
-        SetTextColor(mdc, RGB(80, 255, 120));
-        TextOutA(mdc, 8, 5, t, (int)strlen(t));
+        if (show_fps) {
+            snprintf(t, sizeof t, "FPS %.1f", s_fps_shown);
+            SetTextColor(mdc, RGB(80, 255, 120));
+            TextOutA(mdc, 8, 5, t, (int)strlen(t));
+        }
+        if (have_st) {
+            SetTextColor(mdc, RGB(255, 190, 70));
+            TextOutA(mdc, 8, show_fps ? 25 : 5, st, (int)strlen(st));
+        }
         GdiFlush();
         out = (uint32_t *)malloc((size_t)iw * ih * 4);
         if (out) {
@@ -550,9 +632,10 @@ static void menu_render(void)
                        CLEARTYPE_QUALITY, FIXED_PITCH, "Consolas");
     of = (HFONT)SelectObject(mdc, font);
     {
-        static const char *tabs[] = { "DISPLAY", "EFFECTS", "COSTUMES" };
+        static const char *tabs[] = { "DISPLAY", "EFFECTS", "COSTUMES",
+                                      "CHEATS" };
         int tx = MX + PAD, t;
-        for (t = 0; t < 3; t++) {
+        for (t = 0; t < 4; t++) {
             char tt[24];
             snprintf(tt, sizeof tt, t == s_menu_tab ? "[%s]" : " %s ", tabs[t]);
             SetTextColor(mdc, t == s_menu_tab ? RGB(255, 235, 235) : RGB(140, 125, 140));
@@ -579,11 +662,17 @@ static void menu_render(void)
     }
     SetTextColor(mdc, RGB(140, 125, 140));
     {
-        const char *hint = s_menu_tab == 2
-            ? "Tab: page   outfit applies on next game launch"
-            : "arrows change   Tab: page   F6/Esc close";
-        TextOutA(mdc, MX + PAD, MY + PAD + ROWH + 10 + nitems * ROWH,
-                 hint, (int)strlen(hint));
+        int hy = MY + PAD + ROWH + 10 + nitems * ROWH;
+        const char *hint = s_menu_tab == 3
+            ? "Keys  Tab page   arrows/Enter toggle   F6/Esc close"
+            : "Keys  Tab page   arrows change   F6/Esc close";
+        /* The pad legend, so the bindings are discoverable rather than
+         * something a player has to be told. */
+        const char *pad =
+            "Pad   LB/RB page   D-pad move   A change   B/Back close";
+        TextOutA(mdc, MX + PAD, hy, hint, (int)strlen(hint));
+        SetTextColor(mdc, RGB(120, 150, 170));
+        TextOutA(mdc, MX + PAD, hy + ROWH - 4, pad, (int)strlen(pad));
     }
     GdiFlush();
 
@@ -615,6 +704,13 @@ static void fb_toggle_fullscreen(HWND h);
 static void menu_change(int item, int dir)
 {
     XboxGfxConfig *g = xbox_GfxConfig();
+    if (s_menu_tab == 3) {
+        if (cheat_rows() && s_ch.toggle)
+            s_ch.toggle(item);
+        xbox_GfxConfigSave();      /* the enabled set rides in the ini too */
+        menu_render();
+        return;
+    }
     if (s_menu_tab == 1) {
         static volatile int *const fld[11] = { 0 };  /* placeholder, set below */
         struct { volatile int *v; int lo, hi, step; } e;
@@ -641,6 +737,11 @@ static void menu_change(int item, int dir)
         return;
     }
     if (s_menu_tab == 2) {
+        if (item == N_COSTUMES + 1) {
+            xbox_GfxConfigSave();       /* before we go */
+            game_restart();
+            return;
+        }
         if (item == 0)
             g->light_prop = !g->light_prop;
         else
@@ -656,14 +757,13 @@ static void menu_change(int item, int dir)
         if (g->scale > 4) g->scale = 4;
         break;
     case 1:
-        g->widescreen = !g->widescreen;
-        menu_window_size(s_win_preset, g->widescreen);
+        g->stretch = !g->stretch;
         break;
     case 2:
         s_win_preset += dir;
         if (s_win_preset < 0) s_win_preset = 0;
         if (s_win_preset >= N_WIN_PRESETS) s_win_preset = N_WIN_PRESETS - 1;
-        menu_window_size(s_win_preset, g->widescreen);
+        menu_window_size(s_win_preset);
         break;
     case 3:
         if (s_hwnd_pub)
@@ -684,7 +784,7 @@ static void menu_change(int item, int dir)
 static void menu_key(int vk)
 {
     switch (vk) {
-    case VK_TAB:   s_menu_tab = (s_menu_tab + 1) % 3; s_menu_sel = 0; menu_render(); break;
+    case VK_TAB:   s_menu_tab = (s_menu_tab + 1) % 4; s_menu_sel = 0; menu_render(); break;
     case VK_UP:    s_menu_sel = (s_menu_sel + menu_items_on(s_menu_tab) - 1) % menu_items_on(s_menu_tab); menu_render(); break;
     case VK_DOWN:  s_menu_sel = (s_menu_sel + 1) % menu_items_on(s_menu_tab); menu_render(); break;
     case VK_LEFT:  menu_change(s_menu_sel, -1); break;
@@ -695,11 +795,134 @@ static void menu_key(int vk)
     }
 }
 
+/* Relaunch the game.
+ *
+ * Deliberately with no arguments. A disc image on the command line always
+ * wins in ff_launcher.c -- that is how a player re-extracts after replacing
+ * a bad image -- so carrying the original command line through made every
+ * restart try to unpack 1.4 GB again, over a game folder that was already
+ * good and while this process still held it open. Bare, the launcher finds
+ * the extracted game folder, sees it is valid, and goes straight in.
+ *
+ * The costume is saved before this runs, so the new process reads it at
+ * startup and comes up wearing it.
+ */
+static void game_restart(void)
+{
+    wchar_t exe[MAX_PATH], cmd[MAX_PATH + 4];
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH))
+        return;
+    _snwprintf(cmd, MAX_PATH + 3, L"\"%ls\"", exe);
+    cmd[MAX_PATH + 3] = L'\0';
+
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    if (CreateProcessW(exe, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        ExitProcess(0);
+    }
+}
+
 static void menu_toggle(void)
 {
     s_menu_open = !s_menu_open;
     xbox_InputKeysClear();
+    xbox_InputMenuCapture(s_menu_open);
     menu_render();
+}
+
+/* Driving the menu with the controller.
+ *
+ * Polled once a frame rather than event-driven, because a pad has no key
+ * repeat of its own: holding a direction has to be turned into a stream of
+ * steps here. Edges are tracked per button so a press counts once.
+ *
+ * Back opens and closes it, which the game does not use; A changes a value,
+ * B closes, the shoulders page between tabs. The stick is read alongside the
+ * d-pad so either works.
+ */
+static void menu_pad_poll(void)
+{
+    enum { DEAD = 14000, REP_FIRST = 360, REP_NEXT = 90,
+           BTN_A = 0, BTN_B = 1, BTN_BLACK = 4, BTN_WHITE = 5 };
+    XBOX_INPUT_STATE st;
+    static WORD  prev_b;
+    static BYTE  prev_a[8];
+    static int   vdir, hdir;
+    static DWORD vat, hat;
+    DWORD now = GetTickCount();
+    int nit, d;
+    WORD b;
+
+    if (xbox_InputGetStateRaw(0, &st) != ERROR_SUCCESS) {
+        prev_b = 0;
+        memset(prev_a, 0, sizeof prev_a);
+        vdir = hdir = 0;
+        return;
+    }
+    b = st.Gamepad.wButtons;
+
+#define EDGE_BTN(bit)  (((b) & (bit)) && !(prev_b & (bit)))
+#define EDGE_AN(ix)    (st.Gamepad.bAnalogButtons[ix] >= XBOX_ANALOG_BUTTON_THRESHOLD \
+                        && prev_a[ix] < XBOX_ANALOG_BUTTON_THRESHOLD)
+
+    if (EDGE_BTN(XBOX_GAMEPAD_BACK))
+        menu_toggle();
+
+    if (!s_menu_open) {
+        vdir = hdir = 0;
+        goto done;
+    }
+    nit = menu_items_on(s_menu_tab);
+
+    d = 0;
+    if ((b & XBOX_GAMEPAD_DPAD_UP)   || st.Gamepad.sThumbLY >  DEAD) d = -1;
+    if ((b & XBOX_GAMEPAD_DPAD_DOWN) || st.Gamepad.sThumbLY < -DEAD) d =  1;
+    if (!d) {
+        vdir = 0;
+    } else if (d != vdir) {
+        vdir = d; vat = now + REP_FIRST;
+        s_menu_sel = (s_menu_sel + (d > 0 ? 1 : nit - 1)) % nit;
+        menu_render();
+    } else if ((long)(now - vat) >= 0) {
+        vat = now + REP_NEXT;
+        s_menu_sel = (s_menu_sel + (d > 0 ? 1 : nit - 1)) % nit;
+        menu_render();
+    }
+
+    d = 0;
+    if ((b & XBOX_GAMEPAD_DPAD_LEFT)  || st.Gamepad.sThumbLX < -DEAD) d = -1;
+    if ((b & XBOX_GAMEPAD_DPAD_RIGHT) || st.Gamepad.sThumbLX >  DEAD) d =  1;
+    if (!d) {
+        hdir = 0;
+    } else if (d != hdir) {
+        hdir = d; hat = now + REP_FIRST;
+        menu_change(s_menu_sel, d);
+    } else if ((long)(now - hat) >= 0) {
+        hat = now + REP_NEXT;
+        menu_change(s_menu_sel, d);
+    }
+
+    if (EDGE_AN(BTN_A))
+        menu_change(s_menu_sel, 1);
+    if (EDGE_AN(BTN_B))
+        menu_toggle();
+    if (EDGE_AN(BTN_WHITE)) {
+        s_menu_tab = (s_menu_tab + 3) % 4; s_menu_sel = 0; menu_render();
+    }
+    if (EDGE_AN(BTN_BLACK)) {
+        s_menu_tab = (s_menu_tab + 1) % 4; s_menu_sel = 0; menu_render();
+    }
+
+done:
+#undef EDGE_BTN
+#undef EDGE_AN
+    prev_b = b;
+    memcpy(prev_a, st.Gamepad.bAnalogButtons, sizeof prev_a);
 }
 
 static void fb_toggle_fullscreen(HWND h)
@@ -936,7 +1159,9 @@ static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
         FillRect(hdc, &c, (HBRUSH)GetStockObject(BLACK_BRUSH));
         lw = cw; lh = ch;
     }
-    if ((long long)cw * s_fb_height <= (long long)ch * s_fb_width) {
+    if (xbox_GfxConfig()->stretch) {
+        w = cw; h = ch;
+    } else if ((long long)cw * s_fb_height <= (long long)ch * s_fb_width) {
         w = cw; h = (LONG)((long long)cw * s_fb_height / s_fb_width);
     } else {
         h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
@@ -1007,8 +1232,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 r.left = 0; r.top = 0; r.right = cw; r.bottom = chh;
                 AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
                 for (i = 0; i < N_WIN_PRESETS; i++)
-                    if ((s_win_presets[i].w43 == cw && s_win_presets[i].h43 == chh)
-                        || (s_win_presets[i].w169 == cw && s_win_presets[i].h169 == chh))
+                    if (s_win_presets[i].w == cw && s_win_presets[i].h == chh)
                         s_win_preset = i;
             }
         }
@@ -1131,11 +1355,15 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 tb[127] = 0;
                 SetWindowTextW(hwnd, tb);
                 s_fps_shown = t0 ? (float)((f - f0) * 1000.0 / (now - t0)) : 0.0f;
-                if (xbox_GfxConfig()->show_fps && !s_menu_open)
+                if ((xbox_GfxConfig()->show_fps || s_status_cb) && !s_menu_open)
                     menu_render();
                 t0 = now; f0 = f;
             }
         }
+        /* A pad has no auto-repeat of its own, so the menu has to sample it
+         * rather than wait for events. Cheap: one read per frame. */
+        menu_pad_poll();
+
         if (!paced)
             Sleep(16);                  /* D3D11's Present waited for vsync */
     }

@@ -94,6 +94,12 @@ void xbox_InputInit(void);
  */
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
+/* The pad as it really is, ignoring menu capture. For the overlay menu. */
+DWORD xbox_InputGetStateRaw(DWORD dwPort, XBOX_INPUT_STATE *pState);
+
+/* While on, xbox_InputGetState hands the game a neutral pad. */
+void  xbox_InputMenuCapture(int on);
+
 /**
  * Set controller vibration.
  */
