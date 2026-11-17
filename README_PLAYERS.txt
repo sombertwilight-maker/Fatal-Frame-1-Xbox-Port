@@ -4,15 +4,25 @@ Fatal Frame (USA, Xbox) -- native Windows port
 HOW TO PLAY
 -----------
   1. Unzip this folder anywhere.
-  2. Drag your own Fatal Frame (USA) disc image (.iso / .xiso) onto
-     PlayFatalFrame.bat
+  2. Open "Fatal Frame.vbs".
+  3. Press LOAD ISO and choose your own Fatal Frame (USA) disc image
+     (.iso / .xiso), then touch the orb to install.
 
-The first run translates the game from your disc and builds
-fatalframe.exe on this computer. That takes a few minutes and happens
-once. Every run after it starts the game straight away.
+The first run translates the game from your disc and builds it on this
+computer. That takes a few minutes and happens once.
 
-You can also drop the ISO in this folder and just double-click
-PlayFatalFrame.bat -- it will find it.
+After that, "Fatal Frame.vbs" is your launcher: open it and the orb says
+PLAY. It remembers the disc image, so there is nothing to choose again
+and nothing to rebuild. The finished game sits in Game\fatalframe.exe if
+you would rather make a shortcut to it.
+
+REINSTALL builds the game again from your disc. You only need it after
+replacing the release with a newer one -- the game you have keeps working
+until the new build finishes.
+
+If the launcher window will not open, these do the same thing without it:
+  "Play without launcher.bat"  - starts a game you have already built
+  PlayFatalFrame.bat           - drag your disc image onto it to build
 
 
 WHAT YOU NEED

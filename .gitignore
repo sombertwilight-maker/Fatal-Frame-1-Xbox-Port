@@ -29,3 +29,26 @@ tools/python/
 tools/cmake/
 tools/mingw/
 tools/ninja/
+
+# The disc's own formats. Nothing in this project should ever hold one:
+# the player's files live beside their build, never in the repo. A costume
+# texture pack derived from the game's art was committed once, which is
+# what this is here to prevent.
+*.xpr
+*.mpx
+*.mpk
+*.acs
+*.sgd
+*.pkx
+*.xp2
+*.mwa
+*.slt
+*.scn
+*.lit
+*.anm
+*.wav
+*.wmv
+
+# backups left by in-place edits
+*.orig
+*.bak

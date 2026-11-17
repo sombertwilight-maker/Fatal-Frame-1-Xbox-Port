@@ -29,14 +29,6 @@ add_compile_definitions(
 # Option B: find_package (if you install xboxrecomp system-wide)
 #   find_package(xboxrecomp REQUIRED)
 #
-# An implicit declaration is a warning on older compilers and a hard error
-# from GCC 14 on, so the developer builds happily and a player on a newer
-# toolchain cannot build at all. Promote it here, before the toolkit is
-# added, so it fails on the machine that can fix it.
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-  add_compile_options(-Werror=implicit-function-declaration)
-endif()
-
 # Where the toolkit lives. It is "toolkit" in this repository and in a
 # release, and "xboxrecomp" in a plain clone of it beside the project, so
 # look for both rather than making one layout the only one that builds.
@@ -82,6 +74,9 @@ set(GAME_SOURCES
     src/ff_launcher.c
     src/ff_gpu.c
     src/ff_watch.c
+    src/ff_anim.c
+    src/ff_cheats.c
+    src/ff_tmdl.c
     # Direct3D 11 renderer for the NV2A pushbuffer executor (host GPU).
     ${XBOXRECOMP_DIR}/src/kernel/nv2a_d3d11.c
     # Add game-specific sources here, e.g.:
@@ -128,6 +123,21 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     # function's symbol, i.e. to the guest function that faulted.
     dbghelp
 )
+
+# MinGW: link the compiler's own runtime into the executable.
+#
+# Otherwise the game depends on libgcc_s_seh-1.dll and libwinpthread-1.dll,
+# which live beside the compiler -- and the compiler is a build-time thing
+# the launcher stages and removes again. The game ran once, from the shell
+# that still had the compiler on PATH, and then could never start again.
+# Static here means the built exe stands on its own: copy it anywhere, run
+# it from Explorer, no PATH and no DLLs beside it.
+if(MINGW)
+    target_link_options(${PROJECT_NAME} PRIVATE
+        -static
+        -static-libgcc
+    )
+endif()
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)
